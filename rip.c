@@ -1,3 +1,10 @@
+/*
+Use gcc rip.c -o rip -lpthread to compile
+
+
+
+*/
+
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -15,7 +22,7 @@ char *configName[] =  {"router-id", "input-ports", "outputs"};
 
 //============== Global Variables ============================
 
-struct Contact
+struct Peer
 {
     int port;
     int metric;
@@ -29,7 +36,7 @@ struct ConfigItem
     int output_number;
     bool routerid_status;
     int *input;
-    struct Contact *output;
+    struct Peer *output;
 }self;
 
 pthread_t *threads;
@@ -127,7 +134,7 @@ int readConfig(char *cfg_file, struct ConfigItem *item)
                         memset(temp, '\0', sizeof(temp));
 
                         item->output_number++;
-                        item->output = (struct Contact*)realloc(item->output, sizeof(struct Contact) * item->output_number);
+                        item->output = (struct Peer*)realloc(item->output, sizeof(struct Peer) * item->output_number);
                         
 
                         dash = strchr(ptr, '-');
@@ -194,6 +201,8 @@ void listen_port(int port)
         perror("bind");
         exit(1);
     }
+
+    printf("Listening on port %d\n", port);
         
     while(1) 
     {
@@ -224,7 +233,7 @@ void* listen_process(void *argv)
     
     int *port = (int *)argv;
     
-    printf("Listening on port %d\n", *port);
+    
     while(1) 
     {   // forever
         listen_port(*port);
@@ -251,19 +260,16 @@ int main(int argc, char **argv)
 
     readConfig(argv[1], &self);
     
-    printf("Listening: \n===============================\n");
+
     for(int i=0; i<self.input_number; i++)
     {
-        
-
         if (pthread_create(&listener[i],NULL,listen_process,&self.input[i]) != 0)
         {
             perror("create");
             exit(1);
         }
-
     }
-    printf("================================\n");
+
 
     printf("Sending: \n===============================\n");
     for(int i=0; i<self.output_number; i++)
