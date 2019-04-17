@@ -184,13 +184,13 @@ void listen_port(int port)
   
     int sockfd = socket(AF_INET,SOCK_DGRAM,0);   //create UDP socket with default protocol    
     
-    struct sockaddr_in sa, ca; 
+    struct sockaddr_in sa; 
 
     char buf[80];
     char str[INET_ADDRSTRLEN];
     int i, n;
 
-    socklen_t ca_len;
+    socklen_t sa_len;
 
     sa.sin_family = AF_INET;          /* communicate using internet address */
     sa.sin_addr.s_addr = INADDR_ANY; /* accept all calls                   */
@@ -206,16 +206,16 @@ void listen_port(int port)
         
     while(1) 
     {
-        ca_len = sizeof(ca);
-        n = recvfrom(sockfd, buf, 80, 0, (struct sockaddr *)&ca, &ca_len);
+        sa_len = sizeof(sa);
+        n = recvfrom(sockfd, buf, 80, 0, (struct sockaddr *)&sa, &sa_len);
         if (n == -1) {
             perror("recvfrom error");
         }
-        printf("received at PORT %d\n",ntohs(ca.sin_port));
+        printf("received at PORT %d\n",ntohs(sa.sin_port));
         for (i = 0; i < n; i++) {
             buf[i] = toupper(buf[i]);
         }
-        n = sendto(sockfd, buf, n, 0, (struct sockaddr *)&ca, sizeof(ca));
+        n = sendto(sockfd, buf, n, 0, (struct sockaddr *)&sa, sizeof(sa));
         if (n == -1) {
             perror("sendto error");
         }

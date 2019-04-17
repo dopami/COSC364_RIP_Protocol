@@ -9,7 +9,7 @@
  
 #define MAXLINE 80
  
-int main(int argc, char *argv)
+int main(int argc, char **argv)
 {
     struct sockaddr_in servaddr;
     int sockfd, n;
@@ -22,9 +22,10 @@ int main(int argc, char *argv)
     bzero(&servaddr, sizeof(servaddr));
     servaddr.sin_family = AF_INET;
     inet_pton(AF_INET, "127.0.0.1", &servaddr.sin_addr);
-    servaddr.sin_port = htons(argv[1]);
+    servaddr.sin_port = htons(atoi(argv[1]));
  
     while(fgets(buf, MAXLINE, stdin) != NULL) {
+        printf("Sending to %d\n", atoi(argv[1]));
         n = sendto(sockfd, buf, strlen(buf), 0, (struct sockaddr *)&servaddr, sizeof(servaddr));
         if (n == -1) {
             perror("sendto error");
@@ -34,6 +35,7 @@ int main(int argc, char *argv)
             perror("recvfrom error");
         }
         write(STDOUT_FILENO, buf, n);
+
     }
     close(sockfd);
     return 0;
