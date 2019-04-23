@@ -14,9 +14,15 @@ Use gcc rip.c -o rip -lpthread to compile
 #include <unistd.h>
 #include <pthread.h>
 #include <ctype.h>
+#include <signal.h>
+#include <sys/select.h>
+
+#include <fcntl.h>
 
 #define BUF_SIZE 1024
 #define MAX_HOP 15
+#define INTERVAL 30
+#define TIMEOUT 30
 
 char *configName[] =  {"router-id", "input-ports", "outputs"};
 
@@ -29,19 +35,91 @@ struct Peer
     int peer_id;
 };
 
+struct Interface
+{
+    int port;
+    int sockfd;
+};
+
 struct ConfigItem
 {
     int routerid;
     int input_number;
     int output_number;
     bool routerid_status;
-    int *input;
+    struct Interface *input;
     struct Peer *output;
 }self;
+
+struct Route_Table
+{
+    int address;
+    uint32_t metric;
+    int next_hop;
+    bool flag;
+
+};
+
+struct Route_Table *router;
+
+struct Timer_Struct
+{
+    struct timeval timer;
+    void (*fun_ptr)();
+    void *args;
+    bool *cancel;      //necessary?
+};
 
 pthread_t *threads;
 
 //=============================================================
+
+void* time_handler(void *args)
+{
+    struct Timer_Struct *timerdata = (struct Timer_Struct *)args;  //formating the passing args
+    printf("Starting Timer, %d\n", timerdata->timer.tv_sec);       //debug
+    time_t nowtime, starttime;        //set time stamp
+    time(&starttime);      //remember start time
+    while (1)
+    {
+        sleep(1);         //wait 1 second
+        time(&nowtime);   //check current time
+        if (nowtime - starttime >= timerdata->timer.tv_sec) //if time elapse >= timer value
+        {
+            (timerdata->fun_ptr)(timerdata->args);       //call the function
+            break;                        //quit loop
+        }
+    }
+
+    pthread_exit(0);                      //exit thread
+}
+
+
+void set_time(struct timeval *timer, void (*fun_ptr)(), void *args)
+{
+    pthread_t timer_thread;          //create timer thread id
+    struct Timer_Struct timerdata;    //initial passing args
+    timerdata.timer = *timer;
+    timerdata.fun_ptr = fun_ptr;
+    timerdata.args = args;
+
+
+    if (pthread_create(&timer_thread,NULL,time_handler,&timerdata) != 0) //create timer thread
+    {
+            perror("TimeHandler");
+            exit(1);
+    }
+
+    if (pthread_join(timer_thread, NULL) != 0) {       //waiting for timer thread quit
+            perror("pthread_join");
+            exit(1);
+        }
+    printf("Timer quit success\n");
+
+}
+
+
+
 
 void init(struct ConfigItem *item)
 {
@@ -112,15 +190,15 @@ int readConfig(char *cfg_file, struct ConfigItem *item)
                     while ((ptr = strtok(content, ",")) != NULL)
                     {
                         item->input_number++;
-                        item->input = (int*)realloc(item->input, sizeof(int) * item->input_number);
+                        item->input = (struct Interface*)realloc(item->input, sizeof(struct Interface) * item->input_number);
                         if (item->input == NULL)
                         {
                             printf("realloc error/n/n");
                         }
-                        item->input[item->input_number - 1] = atoi(ptr);                       
+                        item->input[item->input_number - 1].port = atoi(ptr);                       
                         content = NULL;
 
-                        printf("INPUT:%d\n", item->input[item->input_number - 1]);
+                        printf("INPUT:%d\n", item->input[item->input_number - 1].port);
                     }
 
                 }
@@ -176,37 +254,85 @@ int readConfig(char *cfg_file, struct ConfigItem *item)
 }
 
 
-
-
-
-void listen_port(int port)
+bool check_valid_receive(int port)
 {
-  
-    int sockfd = socket(AF_INET,SOCK_DGRAM,0);   //create UDP socket with default protocol    
+    bool result = false;
+    for (int i = 0; i < self.output_number; i++)
+    {
+        if (port == self.output[i].port)
+        {
+            result = true;
+            break;
+        }
+    }
+    return result;
+}
+
+
+void listen_port(struct Interface *interface)
+{
+    struct timeval recv_timeout;   //set timeout value
+    interface->sockfd = socket(AF_INET,SOCK_DGRAM,0);   //create UDP socket with default protocol    
     
-    struct sockaddr_in sa; 
+    fd_set recvfd, sendfd;
+
+    struct sockaddr_in local, remote; 
+    local.sin_family = AF_INET;          /* communicate using internet address */
+    local.sin_addr.s_addr = INADDR_ANY; /* accept all calls                   */
+    local.sin_port = htons(interface->port); /* this is port number                */
+
+    socklen_t remote_len;
 
     char buf[80];
-    char str[INET_ADDRSTRLEN];
-    int i, n;
 
-    socklen_t sa_len;
+    int i, rc, remote_port;
 
-    sa.sin_family = AF_INET;          /* communicate using internet address */
-    sa.sin_addr.s_addr = INADDR_ANY; /* accept all calls                   */
-    sa.sin_port = htons(port); /* this is port number                */
-        
-    int rc = bind(sockfd,(struct sockaddr *)&sa,sizeof(sa)); /* bind address to socket   */ 
+    rc = bind(interface->sockfd,(struct sockaddr *)&local,sizeof(local)); /* bind address to socket   */ 
     if(rc == -1) { // Check for errors
         perror("bind");
         exit(1);
     }
 
-    printf("Listening on port %d\n", port);
-        
+    printf("Listening on port %d\n", interface->port);
+
+
+
+
     while(1) 
     {
-        sa_len = sizeof(sa);
+        FD_ZERO(&recvfd);        
+        FD_SET(interface->sockfd, &recvfd); 
+
+        FD_ZERO(&sendfd);
+        FD_SET(interface->sockfd, &sendfd); 
+
+        recv_timeout.tv_sec = TIMEOUT;
+        recv_timeout.tv_usec = 0;
+        switch(select(interface->sockfd + 1, &recvfd, NULL, NULL, &recv_timeout))
+        {
+            case -1:
+                printf("select error\n");
+                break;
+            case 0:
+                printf("TIMEOUT: Listening on port %d\n", interface->port);
+                break;
+            default:
+                if (FD_ISSET(interface->sockfd, &recvfd))
+                {
+                    rc = recvfrom(interface->sockfd, buf, 80, 0, (struct sockaddr *)&remote, &remote_len);
+                    if (rc == -1) {
+                        perror("recvfrom error");
+                    }      
+                    remote_port = ntohs(remote.sin_port); 
+                    if (check_valid_receive(remote_port)) printf("Received %s at PORT %d\n",buf, remote_port);
+                }
+
+
+
+                
+
+        }
+        /*sa_len = sizeof(sa);
         n = recvfrom(sockfd, buf, 80, 0, (struct sockaddr *)&sa, &sa_len);
         if (n == -1) {
             perror("recvfrom error");
@@ -218,37 +344,72 @@ void listen_port(int port)
         n = sendto(sockfd, buf, n, 0, (struct sockaddr *)&sa, sizeof(sa));
         if (n == -1) {
             perror("sendto error");
-        }
+        }*/
+
+
     }
 
 
-    close(sockfd);
+    close(interface->sockfd);
 
 }
 
+
+void update_ports(struct Interface *interface)
+{
+    struct sockaddr_in remote; 
+
+
+    remote.sin_family = AF_INET;          /* communicate using internet address */
+    remote.sin_addr.s_addr = INADDR_ANY; /* accept all calls                   */
+    remote.sin_port = htons(self.output[0].port); /* this is port number                */
+
+
+    int rc = sendto(interface->sockfd, "update", 6, 0, (struct sockaddr *)&remote, sizeof(remote));
+    if (rc == -1) {
+    perror("sendto error");
+    }
+}
 
 
 void* listen_process(void *argv)
 {
     
-    int *port = (int *)argv;
+    struct Interface *interface = (struct Interface *)argv;
     
     
-    while(1) 
-    {   // forever
-        listen_port(*port);
+
+    listen_port(interface);
        
-    }
 
     pthread_exit(0);
 }
 
+void* update_process()
+{
+    while(1)
+    {
+        for (int i = 0; i < self.input_number; i++)
+        {
+            update_ports(&self.input[i]);
+        }
+        sleep (5);
+    }
+    pthread_exit(0);
+}
+
+void fun(void* args) 
+{ 
+    int *a = (int*) args;
+    printf("function called success %d \n", *a); 
+} 
 
 
 int main(int argc, char **argv) 
 {
 
     pthread_t listener[self.input_number];   //create PIDs
+    pthread_t updater;
 
     init(&self);
 
@@ -260,6 +421,13 @@ int main(int argc, char **argv)
 
     readConfig(argv[1], &self);
     
+    struct timeval temp;
+    temp.tv_sec = 12;
+    temp.tv_usec = 0;
+    
+    int a = 12;
+    set_time(&temp, &fun, &a);
+
 
     for(int i=0; i<self.input_number; i++)
     {
@@ -279,7 +447,11 @@ int main(int argc, char **argv)
     printf("================================\n");
 
     
-
+    if (pthread_create(&updater,NULL,update_process, NULL) != 0)
+        {
+            perror("create");
+            exit(1);
+        }
 
     
     for(int i=0; i<self.input_number; i++)
