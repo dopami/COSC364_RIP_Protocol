@@ -21,8 +21,12 @@ Use gcc rip.c -o rip -lpthread to compile
 
 #define BUF_SIZE 1024
 #define MAX_HOP 15
-#define INTERVAL 30
-#define TIMEOUT 30
+#define UPDATE 5
+#define TIMEOUT UPDATE*6
+#define GARBAGE UPDATE*4
+
+typedef char byte;
+
 
 char *configName[] =  {"router-id", "input-ports", "outputs"};
 
@@ -32,13 +36,15 @@ struct Peer
 {
     int port;
     int metric;
-    int peer_id;
+    int routerid;
 };
 
 struct Interface
 {
     int port;
     int sockfd;
+    struct Peer *neighbor;
+    bool found_peer;
 };
 
 struct ConfigItem
@@ -52,15 +58,18 @@ struct ConfigItem
 }self;
 
 struct Route_Table
-{
+{   
+    struct Route_Table *next;
     int address;
     uint32_t metric;
     int next_hop;
     bool flag;
+    struct timeval timeout;
+    struct timeval garbage_collect;
+    int iface;
+}*routetable;
 
-};
 
-struct Route_Table *router;
 
 struct Timer_Struct
 {
@@ -70,9 +79,183 @@ struct Timer_Struct
     bool *cancel;      //necessary?
 };
 
-pthread_t *threads;
+
+struct ripHeader {
+  byte command; 		/* 1-REQUEST, 2-RESPONSE */
+  byte version;
+  short int zero;
+};
+
+
+struct ripEntry {
+  short int addrfamily;
+  short int zero;
+  uint32_t destination;    // neighbor port
+  uint32_t zero1;
+  uint32_t zero2;
+  uint32_t metric;
+};
+
+struct packet
+{
+    char *message;
+    int size;
+};
 
 //=============================================================
+
+void packet_header(struct packet *msg, struct ripHeader rh)
+{   
+
+    msg->size += sizeof(rh);
+    msg->message = (char*)malloc(msg->size);
+    memset(msg->message, '\0', msg->size);
+    memcpy(msg->message, (void*)&rh, sizeof(rh));
+}
+
+void packet_entry(struct packet *msg, struct ripEntry re)
+{   
+
+    
+    msg->message = (char*)realloc(msg->message, msg->size + sizeof(re));
+    memset(msg->message + msg->size, '\0', sizeof(re));
+    memcpy(msg->message + msg->size, (void*)&re, sizeof(re));
+    msg->size += sizeof(re);
+}
+
+void add_route_table(struct ripEntry *re, int nexthop, int iface)
+{
+    //check metric
+    if (re->metric >= MAX_HOP)
+    {
+        printf("metric out of range, drop\n");
+    }
+    else
+    {
+        
+        //scan routetable
+        struct Route_Table *item, *prior;
+        item = routetable;
+        prior = item;
+        bool found = false;
+        
+        do
+        {
+            if(item->address == re->destination)
+            {
+                found = true;
+                if(item->metric <= re->metric + 1) 
+                printf("%d metric larger than current, drop\n", re->destination);
+                else
+                {
+                    printf("Changing %d in routetable:\n", nexthop);
+                    item->metric = re->metric + 1;
+                    item->next_hop = nexthop;
+                    item->iface = iface;
+                    item->flag = true;
+                    
+                }
+
+            }
+            prior = item;
+            item = item->next;
+            
+        }while (item != NULL);
+        
+        if(!found)
+        {
+            printf("Adding %d to routetable:\n", nexthop);
+            struct Route_Table *node;
+            node = (struct Route_Table*)malloc(sizeof(struct Route_Table));
+            node->address = re->destination;
+            node->metric = re->metric + 1;
+            node->next_hop = nexthop;
+            node->iface = iface;
+            node->flag = true;
+            node->next = NULL;
+            prior->next = node;
+        }
+
+    }
+    
+}
+
+void decode_packet(char* packet, int size, int nexthop, int iface)
+{
+    struct ripHeader rh;
+    struct ripEntry re;
+    int i = 4;
+    
+    while (size - i > 0)
+    {
+        memcpy(&re, (void*)packet + i, sizeof(re));
+        printf("GET ADDRESS: %d, metric: %d, next_hop: %d\n", re.destination, re.metric, nexthop);
+        add_route_table(&re, nexthop, iface);
+        i += sizeof(re);
+    }
+    
+}
+
+
+
+
+void generate_update(struct packet *msg, int nexthop) 
+{ 
+    struct ripHeader rh;
+    struct ripEntry re;
+    rh.command = 1;
+    rh.version = 2;
+    rh.zero = 0;
+    packet_header(msg, rh);
+
+    re.addrfamily = 2;
+    re.zero = 0;
+    re.zero1 = 0;
+    re.zero2 = 0;
+    /*re.destination = self.routerid;
+    re.metric = 0;
+    packet_entry(msg, re);*/
+
+    struct Route_Table *item = routetable;
+    while(item != NULL)
+    {
+        if (item->next_hop != nexthop)
+        {
+            re.destination = item->address;
+            re.metric = item->metric;
+            packet_entry(msg, re);
+        }
+
+        item = item->next;
+    }
+
+} 
+
+
+
+/*
+int decode_rip_message(char *message, struct rip_Header *rh, struct rip_Entry *rte )
+{
+  LOG_FLOW("\n entering dec_rip_msg,msglen = %d",sizeof(message));
+  *rh = *(struct rip_Header *)message;
+  print_rip_header(rh);
+ 
+  message += sizeof(struct rip_Header);
+  int entry_count = 0;
+  if(rh->command == REQUEST) {
+    rte[0] = *(struct rip_Entry *)message;
+    print_rip_entry(&rte[0]);
+    return 1;
+  }
+  while(*message != '\0') {
+    rte[entry_count++] = *(struct rip_Entry *)message;
+    message += sizeof(struct rip_Entry);
+  }
+  LOG_FLOW("\nexiting dec_rip_msg\n");
+  return entry_count;
+} // decode_rip_message */
+
+
 
 void* time_handler(void *args)
 {
@@ -94,26 +277,26 @@ void* time_handler(void *args)
     pthread_exit(0);                      //exit thread
 }
 
-
-void set_time(struct timeval *timer, void (*fun_ptr)(), void *args)
+//void set_time(struct timeval *timer, void (*fun_ptr)(), void *args)
+void set_time(struct Timer_Struct *timerdata)
 {
     pthread_t timer_thread;          //create timer thread id
-    struct Timer_Struct timerdata;    //initial passing args
+    /*struct Timer_Struct timerdata;    //initial passing args
     timerdata.timer = *timer;
     timerdata.fun_ptr = fun_ptr;
-    timerdata.args = args;
+    timerdata.args = args;*/
 
 
-    if (pthread_create(&timer_thread,NULL,time_handler,&timerdata) != 0) //create timer thread
+    if (pthread_create(&timer_thread,NULL,time_handler,timerdata) != 0) //create timer thread
     {
             perror("TimeHandler");
             exit(1);
     }
 
-    if (pthread_join(timer_thread, NULL) != 0) {       //waiting for timer thread quit
+    /*if (pthread_join(timer_thread, NULL) != 0) {       //waiting for timer thread quit
             perror("pthread_join");
             exit(1);
-        }
+        }*/
     printf("Timer quit success\n");
 
 }
@@ -121,14 +304,23 @@ void set_time(struct timeval *timer, void (*fun_ptr)(), void *args)
 
 
 
-void init(struct ConfigItem *item)
+void init()
 {
-    item->routerid = -1;
-    item->input_number = 0;
-    item->output_number = 0;
-    item->routerid_status = false;
-    item->input = NULL;
-    item->output = NULL;
+    self.routerid = -1;
+    self.input_number = 0;
+    self.output_number = 0;
+    self.routerid_status = false;
+    self.input = NULL;
+    self.output = NULL;
+
+    routetable = (struct Route_Table*)malloc(sizeof(struct Route_Table));
+    routetable->next = NULL;
+    routetable->address = self.routerid;
+    routetable->metric = 0;
+    routetable->next_hop = 0;
+    routetable->iface = 0;
+    routetable->flag = false;
+
 }
 
 
@@ -195,7 +387,10 @@ int readConfig(char *cfg_file, struct ConfigItem *item)
                         {
                             printf("realloc error/n/n");
                         }
-                        item->input[item->input_number - 1].port = atoi(ptr);                       
+                        item->input[item->input_number - 1].port = atoi(ptr); 
+                        item->input[item->input_number - 1].neighbor = NULL;
+                        item->input[item->input_number - 1].found_peer = false;
+                        item->input[item->input_number - 1].sockfd = 0;
                         content = NULL;
 
                         printf("INPUT:%d\n", item->input[item->input_number - 1].port);
@@ -228,13 +423,13 @@ int readConfig(char *cfg_file, struct ConfigItem *item)
 
                         memset(temp, '\0', sizeof(temp));
                         strcpy(temp, dash + 1);
-                        item->output[item->output_number - 1].peer_id = atoi(temp);
+                        item->output[item->output_number - 1].routerid = atoi(temp);
 
                         content = NULL;
                         printf("OUTPUT: port: %d, metric: %d, peer: %d\n",  
                             item->output[item->output_number - 1].port, 
                             item->output[item->output_number - 1].metric, 
-                            item->output[item->output_number - 1].peer_id);
+                            item->output[item->output_number - 1].routerid);
                     }
 
                 }
@@ -283,7 +478,7 @@ void listen_port(struct Interface *interface)
 
     socklen_t remote_len;
 
-    char buf[80];
+    char buf[BUF_SIZE];
 
     int i, rc, remote_port;
 
@@ -319,12 +514,29 @@ void listen_port(struct Interface *interface)
             default:
                 if (FD_ISSET(interface->sockfd, &recvfd))
                 {
-                    rc = recvfrom(interface->sockfd, buf, 80, 0, (struct sockaddr *)&remote, &remote_len);
+                    rc = recvfrom(interface->sockfd, buf, BUF_SIZE, 0, (struct sockaddr *)&remote, &remote_len);
                     if (rc == -1) {
                         perror("recvfrom error");
                     }      
                     remote_port = ntohs(remote.sin_port); 
-                    if (check_valid_receive(remote_port)) printf("Received %s at PORT %d\n",buf, remote_port);
+                    if (check_valid_receive(remote_port)) 
+                    {
+                        //printf("Received %s at PORT %d\n",buf, remote_port);
+                        struct Peer *peer; 
+                        for(i = 0; i < self.output_number; i++)
+                        {
+                            if (self.output[i].port == remote_port)
+                            {
+                                peer = &self.output[i];
+                                break;
+                            }
+                        }
+                        interface->neighbor = peer;
+                        interface->found_peer = true;
+
+                        decode_packet(buf, rc, interface->neighbor->routerid,interface->port);
+                        
+                    }
                 }
 
 
@@ -355,22 +567,67 @@ void listen_port(struct Interface *interface)
 }
 
 
-void update_ports(struct Interface *interface)
+void send_update(struct Interface *interface)
 {
+    int rc;
     struct sockaddr_in remote; 
 
 
     remote.sin_family = AF_INET;          /* communicate using internet address */
     remote.sin_addr.s_addr = INADDR_ANY; /* accept all calls                   */
-    remote.sin_port = htons(self.output[0].port); /* this is port number                */
+    
+    
+    struct packet msg;
+    msg.size = 0;
 
-
-    int rc = sendto(interface->sockfd, "update", 6, 0, (struct sockaddr *)&remote, sizeof(remote));
-    if (rc == -1) {
-    perror("sendto error");
+    if (interface->found_peer) 
+    {
+        remote.sin_port = htons(interface->neighbor->port);    /* this is port number  */
+        generate_update(&msg, interface->neighbor->routerid) ;
+        printf("sending\n");
+        rc = sendto(interface->sockfd, msg.message, msg.size, 0, (struct sockaddr *)&remote, sizeof(remote));
+        //int rc = sendto(interface->sockfd, "update", 6, 0, (struct sockaddr *)&remote, sizeof(remote));
+        if (rc == -1) {
+            perror("sendto error");
+        }
     }
+    else 
+    {
+
+        generate_update(&msg, -1) ;
+        printf("sending\n");
+        for(int i = 0; i < self.output_number; i++)
+        {
+            remote.sin_port = htons(self.output[i].port);    /* this is port number  */
+            rc = sendto(interface->sockfd, msg.message, msg.size, 0, (struct sockaddr *)&remote, sizeof(remote));
+            //int rc = sendto(interface->sockfd, "update", 6, 0, (struct sockaddr *)&remote, sizeof(remote));
+            if (rc == -1) {
+                perror("sendto error");
+            }
+        }
+
+    }
+    //printf("message is  %s , %d\n", message); 
+    //print_bytes(msg.message, msg.size);
+
 }
 
+
+void print_route_table()
+{
+    printf("\n=======Route Table=======\n");
+    printf("%-10s%-10s%-10s%-10s%-10s\n","Dest", "Metric", "Next Hop", "ChgFlag", "Iface");
+    struct Route_Table *item = routetable->next;
+    while(item != NULL)
+    {
+        char flag = 'N';
+        if (item->flag) flag = 'Y';
+        printf("%-10d%-10d%-10d%-10c%-10d\n",item->address, item->metric, item->next_hop, flag, item->iface);
+
+        item = item->next;
+    }
+    printf("=======Route Table END=======\n");
+}
 
 void* listen_process(void *argv)
 {
@@ -391,17 +648,31 @@ void* update_process()
     {
         for (int i = 0; i < self.input_number; i++)
         {
-            update_ports(&self.input[i]);
+            send_update(&self.input[i]);
         }
-        sleep (5);
+        print_route_table();
+        sleep (UPDATE);
     }
     pthread_exit(0);
 }
+
+
+void print_bytes(unsigned char *bytes, size_t num_bytes) {
+    
+  for (size_t i = 0; i < num_bytes; i++) {
+    printf("%*u ", 3, bytes[i]);
+  }
+  printf("\n");
+}
+
+
+
 
 void fun(void* args) 
 { 
     int *a = (int*) args;
     printf("function called success %d \n", *a); 
+
 } 
 
 
@@ -411,7 +682,7 @@ int main(int argc, char **argv)
     pthread_t listener[self.input_number];   //create PIDs
     pthread_t updater;
 
-    init(&self);
+    init();
 
     if (argc != 2) 
     {
@@ -421,14 +692,20 @@ int main(int argc, char **argv)
 
     readConfig(argv[1], &self);
     
-    struct timeval temp;
-    temp.tv_sec = 12;
-    temp.tv_usec = 0;
+    routetable->address = self.routerid;
+
+    int a = 12345;
+
+    struct Timer_Struct timerdata;    //initial passing args
+    timerdata.timer.tv_sec = 5;
+    timerdata.timer.tv_usec = 0;
+    timerdata.fun_ptr = &fun;
+    timerdata.args = &a;
     
-    int a = 12;
-    set_time(&temp, &fun, &a);
+    
+    set_time(&timerdata);
 
-
+    
     for(int i=0; i<self.input_number; i++)
     {
         if (pthread_create(&listener[i],NULL,listen_process,&self.input[i]) != 0)
@@ -442,7 +719,7 @@ int main(int argc, char **argv)
     printf("Sending: \n===============================\n");
     for(int i=0; i<self.output_number; i++)
     {
-         printf("OUTPUT: port: %d, metric: %d, peer: %d\n",  self.output[i].port, self.output[i].metric, self.output[i].peer_id);
+         printf("OUTPUT: port: %d, metric: %d, peer: %d\n",  self.output[i].port, self.output[i].metric, self.output[i].routerid);
     }
     printf("================================\n");
 
@@ -453,7 +730,7 @@ int main(int argc, char **argv)
             exit(1);
         }
 
-    
+
     for(int i=0; i<self.input_number; i++)
     {
         if (pthread_join(listener[i], NULL) != 0) {
@@ -462,7 +739,7 @@ int main(int argc, char **argv)
         }
     }
 
-
+    
 
     free(self.input);
     free(self.output);
