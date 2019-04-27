@@ -141,7 +141,7 @@ void* time_handler(void *args)
           //remember start time
     while (timerdata->timer->tv_sec > 0)
     {
-        log_handler("Time left %d\n", timerdata->timer->tv_sec);
+        //log_handler("Time left %d\n", timerdata->timer->tv_sec);
 
         time(&starttime); 
         sleep(1);         //wait 1 second
@@ -303,14 +303,13 @@ void add_route_table(struct ripEntry *re, int nexthop, int iface)
     item = routetable;
     prior = item;
     bool found = false;
-    bool remove = false;
     
     do
     {
         if(item->address == re->destination)
         {
             found = true;   
-            log_handler("found route %d at %d\n", item->address, item);             
+            //log_handler("found route %d at %d\n", item->address, item);             
             break;
 
         }
@@ -336,9 +335,9 @@ void add_route_table(struct ripEntry *re, int nexthop, int iface)
             {
                 log_handler("Changing %d in routetable:\n", re->destination);
                 if (re->metric >= MAX_HOP)
-                {
-                    remove = true;
+                {                    
                     item->metric = MAX_HOP + 1;
+                    item->timeout.tv_sec = 0;
                 }
                 else 
                 {
@@ -354,7 +353,7 @@ void add_route_table(struct ripEntry *re, int nexthop, int iface)
         }
     }
 
-    else
+    else if (re->metric < MAX_HOP)
     {   
         log_handler("Adding %d to routetable:\n", re->destination);
         struct Route_Table *node = (struct Route_Table*)malloc(sizeof(struct Route_Table));
@@ -364,17 +363,10 @@ void add_route_table(struct ripEntry *re, int nexthop, int iface)
         node->flag = true;
         node->valid = true;
         node->next = NULL;
-        if (re->metric > MAX_HOP)
-        {
-            node->timeout.tv_sec = 0; 
-            node->metric = MAX_HOP + 1;
-            
-        }
-        else
-        {
-            node->timeout.tv_sec = TIMEOUT; 
-            node->metric = re->metric + 1;
-        }
+
+        node->timeout.tv_sec = TIMEOUT; 
+        node->metric = re->metric + 1;
+        
 
 
         log_handler("Adding %d to timeout timer, route pointer is %d:\n", node->address, node);
@@ -467,12 +459,10 @@ void generate_update(struct packet *msg, int nexthop)
     struct Route_Table *item = routetable;
     while(item != NULL)
     {
-        if (item->next_hop != nexthop)
-        {
-            re.destination = item->address;
-            re.metric = item->metric;
-            packet_entry(msg, re);
-        }
+        if (item->next_hop != nexthop) re.metric = item->metric;
+        else re.metric = MAX_HOP + 1;    //poison reverse
+        re.destination = item->address;
+        packet_entry(msg, re);
 
         item = item->next;
     }
