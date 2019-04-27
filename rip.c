@@ -61,6 +61,14 @@ struct ConfigItem
     struct Peer *output;
 }self;
 
+struct Timer_Struct
+{
+    struct timeval *timer;
+    void (*fun_ptr)();
+    void *args;
+    bool *cancel;      //necessary?
+};
+
 struct Route_Table
 {   
     struct Route_Table *next;
@@ -69,19 +77,16 @@ struct Route_Table
     int next_hop;
     bool flag;
     struct timeval timeout;
-    struct timeval garbage_collect;
+    struct timeval garbage;
     int iface;
+    bool valid;
+    pthread_t timer_thread;
+    struct Timer_Struct timerdata;
 }*routetable;
 
+pthread_mutex_t write_route_table;
 
 
-struct Timer_Struct
-{
-    struct timeval timer;
-    void (*fun_ptr)();
-    void *args;
-    bool *cancel;      //necessary?
-};
 
 
 struct ripHeader {
@@ -126,6 +131,56 @@ void log_handler(const char *fmt, ...)
     va_end(ap);
 }
 
+void* time_handler(void *args)
+{
+    struct Timer_Struct *timerdata = (struct Timer_Struct *)args;  //formating the passing args
+    log_handler("Starting Timer, %d\n", timerdata->timer->tv_sec);       //debug
+    time_t nowtime, starttime;        //set time stamp
+
+    
+          //remember start time
+    while (timerdata->timer->tv_sec > 0)
+    {
+        log_handler("Time left %d\n", timerdata->timer->tv_sec);
+
+        time(&starttime); 
+        sleep(1);         //wait 1 second
+        time(&nowtime);   //check current time
+        if (timerdata->timer->tv_sec > nowtime - starttime)
+            timerdata->timer->tv_sec -= nowtime - starttime;
+        else timerdata->timer->tv_sec = 0;
+        //log_handler("time still left:%d \n", timerdata->timer->tv_sec);
+    }
+    (timerdata->fun_ptr)(timerdata->args);       //call the function
+
+    pthread_exit(0);                      //exit thread
+}
+
+//void set_time(struct timeval *timer, void (*fun_ptr)(), void *args)
+void set_time(struct Timer_Struct *timerdata, pthread_t *timer_thread)
+{
+    //pthread_t timer_thread;          //create timer thread id
+    /*struct Timer_Struct timerdata;    //initial passing args
+    timerdata.timer = *timer;
+    timerdata.fun_ptr = fun_ptr;
+    timerdata.args = args;*/
+
+
+    log_handler("Set Timer %d\n", timerdata->timer->tv_sec); 
+    if (pthread_create(timer_thread,NULL,time_handler,timerdata) != 0) //create timer thread
+    {
+            perror("TimeHandler");
+            exit(1);
+    }
+
+    /*if (pthread_join(timer_thread, NULL) != 0) {       //waiting for timer thread quit
+            perror("pthread_join");
+            exit(1);
+        }*/
+    log_handler("Timer quit success\n");
+
+}
+
 
 void packet_header(struct packet *msg, struct ripHeader rh)
 {   
@@ -146,67 +201,210 @@ void packet_entry(struct packet *msg, struct ripEntry re)
     msg->size += sizeof(re);
 }
 
+void garbage_collect(void* args)
+{
+    int *address = (int*) args;
+
+    //check metric
+    log_handler("ID:%d, Deleting route table entry\n", *address);
+    //scan routetable
+    struct Route_Table *item, *prior;
+
+    pthread_mutex_lock(&write_route_table);   //lock
+
+
+    item = routetable;
+    prior = item;
+    bool found = false;
+    
+    do
+    {
+        if(&item->address == address)
+        {
+            found = true;
+            prior->next = item->next;
+            free(item);
+            break;
+        }
+        prior = item;
+        item = item->next;
+        
+    }while (item != NULL);
+
+
+    pthread_mutex_unlock(&write_route_table);   //unlock
+}
+
+
+void route_table_timeout(void* args)
+{
+
+    //int *address = (int*) args;
+
+    struct Route_Table *node = (struct Route_Table*) args;
+
+    //check metric
+    log_handler("ID:%d, timeout, removing from route table\n", node->address);
+    //scan routetable
+    //struct Route_Table *item, *prior;
+
+    pthread_mutex_lock(&write_route_table);        //lock
+
+    /*
+    item = routetable;
+    prior = item;
+    bool found = false;
+    
+    do
+    {
+        if(item == address)
+        {
+            found = true;
+            item->metric = MAX_HOP + 1;
+            item->garbage.tv_sec = GARBAGE;
+            break;
+        }
+        prior = item;
+        item = item->next;
+        
+    }while (item != NULL);
+    */
+
+    node->metric = MAX_HOP + 1;
+    node->garbage.tv_sec = GARBAGE;
+
+    struct Timer_Struct timerdata;    //initial passing args
+    timerdata.timer = &node->garbage;
+    timerdata.fun_ptr = &garbage_collect;
+    timerdata.args = &node->address; 
+
+    pthread_mutex_unlock(&write_route_table);     //unlock
+
+
+    pthread_t timer_thread;     
+    set_time(&timerdata, &timer_thread);
+    log_handler("Setting timer %d for garbage collection %d\n", node->garbage, node->address);
+    if (pthread_join(timer_thread, NULL) != 0) 
+            {
+                perror("pthread_join");
+                exit(1);
+            }
+}
+
 void add_route_table(struct ripEntry *re, int nexthop, int iface)
 {
     //check metric
 
-        //scan routetable
-        struct Route_Table *item, *prior;
-        item = routetable;
-        prior = item;
-        bool found = false;
-        
-        do
+    //scan routetable
+    struct Route_Table *item, *prior;
+
+    pthread_mutex_lock(&write_route_table);   //lock
+
+    item = routetable;
+    prior = item;
+    bool found = false;
+    bool remove = false;
+    
+    do
+    {
+        if(item->address == re->destination)
         {
-            if(item->address == re->destination)
+            found = true;   
+            log_handler("found route %d at %d\n", item->address, item);             
+            break;
+
+        }
+        prior = item;
+        item = item->next;
+        
+    }while (item != NULL);
+    
+    if(found)
+    {
+
+
+        if(item->metric == re->metric + 1) 
+        {
+
+            log_handler("ID:%d metric is the same, do nothing\n", re->destination);
+            item->timeout.tv_sec = TIMEOUT;   //renew the timeout 
+            
+        }
+        else
+        {
+            if ((item->next_hop == nexthop) || (item->next_hop != nexthop && item->metric > re->metric))
             {
-                found = true;
-                if(item->metric == re->metric + 1) 
+                log_handler("Changing %d in routetable:\n", re->destination);
+                if (re->metric >= MAX_HOP)
                 {
-                    log_handler("ID:%d metric is the same, do nothing\n", re->destination);
+                    remove = true;
+                    item->metric = MAX_HOP + 1;
                 }
-                else
+                else 
                 {
-                    log_handler("Changing %d in routetable:\n", nexthop);
                     item->metric = re->metric + 1;
                     item->next_hop = nexthop;
                     item->iface = iface;
                     item->flag = true;
-                    
-                }
 
+                    item->timeout.tv_sec = TIMEOUT;   //renew the timeout 
+                }
             }
-            prior = item;
-            item = item->next;
-            
-        }while (item != NULL);
-        
-        if(!found)
+
+        }
+    }
+
+    else
+    {   
+        log_handler("Adding %d to routetable:\n", re->destination);
+        struct Route_Table *node = (struct Route_Table*)malloc(sizeof(struct Route_Table));
+        node->address = re->destination;        
+        node->next_hop = nexthop;
+        node->iface = iface;
+        node->flag = true;
+        node->valid = true;
+        node->next = NULL;
+        if (re->metric > MAX_HOP)
         {
-            log_handler("Adding %d to routetable:\n", nexthop);
-            struct Route_Table *node;
-            node = (struct Route_Table*)malloc(sizeof(struct Route_Table));
-            node->address = re->destination;
+            node->timeout.tv_sec = 0; 
+            node->metric = MAX_HOP + 1;
+            
+        }
+        else
+        {
+            node->timeout.tv_sec = TIMEOUT; 
             node->metric = re->metric + 1;
-            node->next_hop = nexthop;
-            node->iface = iface;
-            node->flag = true;
-            node->next = NULL;
-            prior->next = node;
         }
 
-   
+
+        log_handler("Adding %d to timeout timer, route pointer is %d:\n", node->address, node);
+         //initial passing args
+        node->timerdata.timer = &node->timeout;
+        node->timerdata.fun_ptr = &route_table_timeout;
+        node->timerdata.args = node; 
+        set_time(&node->timerdata, &node->timer_thread);
+
+        prior->next = node;
+    }    
+
+
+    pthread_mutex_unlock(&write_route_table);       //unlock
+ 
     
+
 }
+
+
 
 
 bool rip_head_validation(struct ripHeader *rh)
 {
+    //log_handler("rip head: %d, %d, %d\n", rh->command == COMMAND , rh->version == VERSION , rh->zero == 0);
     return (rh->command == COMMAND && rh->version == VERSION && rh->zero == 0);
 }
 bool rip_entry_validation(struct ripEntry *re)
 {
-    return (re->addrfamily == ADDRFAMILY && re->zero == 0 && re->zero1 == 0 && re->zero2 == 0);
+    return (re->addrfamily == ADDRFAMILY && re->zero == 0 && re->zero1 == 0 && re->zero2 == 0 && re->metric <= MAX_HOP + 1);
 }
 
 void decode_packet(char* packet, int size, int nexthop, int iface)
@@ -220,26 +418,28 @@ void decode_packet(char* packet, int size, int nexthop, int iface)
     }
     else
     {
-        /*memcpy(&rh, (void*)packet, sizeof(rh));
+        memcpy(&rh, (void*)packet, sizeof(rh));
 
-        if (rip_head_validation(&rh))
+        if (!rip_head_validation(&rh))
         {
             log_handler("head invalid, drop it\n");
         }
-        */
-        while (size - i > 0)
+        else
         {
-            memcpy(&re, (void*)packet + i, sizeof(re));
-            log_handler("GET ADDRESS: %d, metric: %d, next_hop: %d\n", re.destination, re.metric, nexthop);
-            if (re.metric > MAX_HOP + 1)
+            while (size - i > 0)
             {
-                log_handler("metric out of range, drop\n");
+                memcpy(&re, (void*)packet + i, sizeof(re));
+                log_handler("GET ADDRESS: %d, metric: %d, next_hop: %d\n", re.destination, re.metric, nexthop);
+                if (!rip_entry_validation(&re))
+                {
+                    log_handler("metric out of range, drop\n");
+                }
+                else 
+                {
+                    add_route_table(&re, nexthop, iface);
+                }
+                i += sizeof(re);
             }
-            else 
-            {
-                add_route_table(&re, nexthop, iface);
-            }
-            i += sizeof(re);
         }
     }   
 }
@@ -281,73 +481,6 @@ void generate_update(struct packet *msg, int nexthop)
 
 
 
-/*
-int decode_rip_message(char *message, struct rip_Header *rh, struct rip_Entry *rte )
-{
-  LOG_FLOW("\n entering dec_rip_msg,msglen = %d",sizeof(message));
-  *rh = *(struct rip_Header *)message;
-  print_rip_header(rh);
- 
-  message += sizeof(struct rip_Header);
-  int entry_count = 0;
-  if(rh->command == REQUEST) {
-    rte[0] = *(struct rip_Entry *)message;
-    print_rip_entry(&rte[0]);
-    return 1;
-  }
-  while(*message != '\0') {
-    rte[entry_count++] = *(struct rip_Entry *)message;
-    message += sizeof(struct rip_Entry);
-  }
-  LOG_FLOW("\nexiting dec_rip_msg\n");
-  return entry_count;
-} // decode_rip_message */
-
-
-
-void* time_handler(void *args)
-{
-    struct Timer_Struct *timerdata = (struct Timer_Struct *)args;  //formating the passing args
-    log_handler("Starting Timer, %d\n", timerdata->timer.tv_sec);       //debug
-    time_t nowtime, starttime;        //set time stamp
-    time(&starttime);      //remember start time
-    while (1)
-    {
-        sleep(1);         //wait 1 second
-        time(&nowtime);   //check current time
-        if (nowtime - starttime >= timerdata->timer.tv_sec) //if time elapse >= timer value
-        {
-            (timerdata->fun_ptr)(timerdata->args);       //call the function
-            break;                        //quit loop
-        }
-    }
-
-    pthread_exit(0);                      //exit thread
-}
-
-//void set_time(struct timeval *timer, void (*fun_ptr)(), void *args)
-void set_time(struct Timer_Struct *timerdata)
-{
-    pthread_t timer_thread;          //create timer thread id
-    /*struct Timer_Struct timerdata;    //initial passing args
-    timerdata.timer = *timer;
-    timerdata.fun_ptr = fun_ptr;
-    timerdata.args = args;*/
-
-
-    if (pthread_create(&timer_thread,NULL,time_handler,timerdata) != 0) //create timer thread
-    {
-            perror("TimeHandler");
-            exit(1);
-    }
-
-    /*if (pthread_join(timer_thread, NULL) != 0) {       //waiting for timer thread quit
-            perror("pthread_join");
-            exit(1);
-        }*/
-    log_handler("Timer quit success\n");
-
-}
 
 
 
@@ -368,6 +501,8 @@ void init()
     routetable->next_hop = 0;
     routetable->iface = 0;
     routetable->flag = false;
+
+    pthread_mutex_t write_route_table = PTHREAD_MUTEX_INITIALIZER;
 
 }
 
@@ -586,26 +721,9 @@ void listen_port(struct Interface *interface)
                         
                     }
                 }
-
-
-
                 
 
         }
-        /*sa_len = sizeof(sa);
-        n = recvfrom(sockfd, buf, 80, 0, (struct sockaddr *)&sa, &sa_len);
-        if (n == -1) {
-            perror("recvfrom error");
-        }
-        printf("received at PORT %d\n",ntohs(sa.sin_port));
-        for (i = 0; i < n; i++) {
-            buf[i] = toupper(buf[i]);
-        }
-        n = sendto(sockfd, buf, n, 0, (struct sockaddr *)&sa, sizeof(sa));
-        if (n == -1) {
-            perror("sendto error");
-        }*/
-
 
     }
 
@@ -641,7 +759,6 @@ void send_update(struct Interface *interface)
     {
         remote.sin_port = htons(interface->neighbor->port);    /* this is port number  */
         generate_update(&msg, interface->neighbor->routerid) ;
-        log_handler("sending\n");
         rc = sendto(interface->sockfd, msg.message, msg.size, 0, (struct sockaddr *)&remote, sizeof(remote));
         //int rc = sendto(interface->sockfd, "update", 6, 0, (struct sockaddr *)&remote, sizeof(remote));
         if (rc == -1) {
@@ -673,13 +790,13 @@ void send_update(struct Interface *interface)
 void print_route_table()
 {
     printf("\n=======Route Table=======\n");
-    printf("%-10s%-10s%-10s%-10s%-10s\n","Dest", "Metric", "Next Hop", "ChgFlag", "Iface");
+    printf("%-10s%-10s%-10s%-10s%-10s%-10s%-10s%-10s\n","Dest", "Metric", "NextHop", "ChgFlag", "Iface", "Timeout", "Garbage", "Pointer");
     struct Route_Table *item = routetable->next;
     while(item != NULL)
     {
         char flag = 'N';
         if (item->flag) flag = 'Y';
-        printf("%-10d%-10d%-10d%-10c%-10d\n",item->address, item->metric, item->next_hop, flag, item->iface);
+        printf("%-10d%-10d%-10d%-10c%-10d%-10d%-10d%-10d\n",item->address, item->metric, item->next_hop, flag, item->iface, item->timeout.tv_sec, item->garbage.tv_sec, item);
 
         item = item->next;
     }
@@ -745,16 +862,18 @@ int main(int argc, char **argv)
     routetable->address = self.routerid;
 
     int a = 12345;
-
+    struct timeval temp_timer;
+    temp_timer.tv_sec = 5;
+    temp_timer.tv_usec = 0;
+/*
     struct Timer_Struct timerdata;    //initial passing args
-    timerdata.timer.tv_sec = 5;
-    timerdata.timer.tv_usec = 0;
+    timerdata.timer = &temp_timer;
     timerdata.fun_ptr = &fun;
     timerdata.args = &a;
     
-    
-    set_time(&timerdata);
-
+    pthread_t timer_thread; 
+    set_time(&timerdata, &timer_thread);
+*/
     
     for(int i=0; i<self.input_number; i++)
     {
