@@ -66,7 +66,7 @@ struct Timer_Struct
     void (*fun_ptr)();
     void *args;
     pthread_t timer_thread;    //the PID of timer threads which we can easily manage the timer
-    bool cancel;      //necessary?
+    bool valid;      //if receive good msg while invalid, cancel the garbage handler and re-init the timer
 };
 
 struct Route_Table
@@ -79,8 +79,7 @@ struct Route_Table
     struct Timer_Struct timeout;
     struct Timer_Struct garbage;
     int iface;                  //the interface to next hop
-    bool valid;          //mark the garbage period, 
-                         //if receive good msg while invalid, cancel the garbage handler and re-init the timer
+                         
     
     //struct Timer_Struct timerdata;
 }*routetable;
@@ -148,7 +147,7 @@ void* time_handler(void *args)
 
     
           //remember start time
-    while (timerdata->timer.tv_sec > 0)
+    while (timerdata->timer.tv_sec > 0 && timerdata->valid)
     {
         //log_handler("Time left %d\n", timerdata->timer->tv_sec);
 
@@ -160,9 +159,12 @@ void* time_handler(void *args)
         else timerdata->timer.tv_sec = 0;
         //log_handler("time still left:%d \n", timerdata->timer->tv_sec);
     }
-    (timerdata->fun_ptr)(timerdata->args);       //call the function
 
+    if (timerdata->valid)  (timerdata->fun_ptr)(timerdata->args);       //call the function
+    
     pthread_exit(0);                      //exit thread
+
+    
 }
 
 //void set_time(struct timeval *timer, void (*fun_ptr)(), void *args)
@@ -209,6 +211,106 @@ void packet_entry(struct packet *msg, struct ripEntry re)
     memcpy(msg->message + msg->size, (void*)&re, sizeof(re));
     msg->size += sizeof(re);
 }
+
+
+
+void generate_update(struct packet *msg, int nexthop, struct Route_Table *node) 
+{ 
+    struct ripHeader rh;
+    struct ripEntry re;
+    rh.command = COMMAND;
+    rh.version = VERSION;
+    rh.routerid = self.routerid;
+    packet_header(msg, rh);
+
+    re.addrfamily = ADDRFAMILY;
+    re.zero = 0;
+    re.zero1 = 0;
+    re.zero2 = 0;
+    /*re.destination = self.routerid;
+    re.metric = 0;
+    packet_entry(msg, re);*/
+
+    if (node == NULL)  //regular update
+    {
+        struct Route_Table *item = routetable;
+        while(item != NULL)
+        {
+            if (item->next_hop != nexthop) re.metric = item->metric;
+            else re.metric = MAX_HOP + 1;    //poison reverse
+            re.destination = item->address;
+            packet_entry(msg, re);
+
+            item = item->next;
+        }
+    }
+    else   //triggered update
+    {
+        if (node->next_hop != nexthop) re.metric = node->metric;
+        else re.metric = MAX_HOP + 1;    //poison reverse
+        re.destination = node->address;
+        packet_entry(msg, re);
+    }
+
+} 
+
+
+
+void send_update(struct Interface *interface, struct Route_Table *node)
+{
+    int rc;
+    struct sockaddr_in remote; 
+
+
+    remote.sin_family = AF_INET;          /* communicate using internet address */
+    remote.sin_addr.s_addr = INADDR_ANY; /* accept all calls                   */
+    
+    
+    struct packet msg;
+    msg.size = 0;
+
+    if (interface->found_peer) 
+    {
+        remote.sin_port = htons(interface->neighbor->port);    /* this is port number  */
+        generate_update(&msg, interface->neighbor->routerid, node) ;
+        rc = sendto(interface->sockfd, msg.message, msg.size, 0, (struct sockaddr *)&remote, sizeof(remote));
+        //int rc = sendto(interface->sockfd, "update", 6, 0, (struct sockaddr *)&remote, sizeof(remote));
+        if (rc == -1) {
+            perror("sendto error");
+        }
+    }
+    else 
+    {
+
+        generate_update(&msg, -1, node) ;
+        for(int i = 0; i < self.output_number; i++)
+        {
+            remote.sin_port = htons(self.output[i].port);    /* this is port number  */
+            rc = sendto(interface->sockfd, msg.message, msg.size, 0, (struct sockaddr *)&remote, sizeof(remote));
+            //int rc = sendto(interface->sockfd, "update", 6, 0, (struct sockaddr *)&remote, sizeof(remote));
+            if (rc == -1) {
+                perror("sendto error");
+            }
+            //print_bytes(msg.message, msg.size);
+        }
+
+    }
+    //printf("message is  %s , %d\n", message); 
+    //print_bytes(msg.message, msg.size);
+
+}
+
+
+void triggered_update(struct Route_Table *node)
+{
+
+    for (int i = 0; i < self.input_number; i++)
+        {
+            send_update(&self.input[i], node);
+        }
+}
+
+
 
 void garbage_collect(void* args)
 {
@@ -280,15 +382,27 @@ void route_table_timeout(void* args)
     */
 
     node->metric = MAX_HOP + 1;
+    triggered_update(node);
     pthread_mutex_unlock(&write_route_table);     //unlock
-    
+    node->garbage.valid = true;
     set_time(&node->garbage, &node->garbage.timer_thread);
     log_handler("Setting timer %d for garbage collection %d\n", node->garbage.timer, node->address);
+    
     if (pthread_join(node->garbage.timer_thread, NULL) != 0) 
             {
                 perror("pthread_join");
                 exit(1);
             }
+
+    if (!node->garbage.valid)
+    {
+        log_handler("Need to cancel garbage process\n");
+        node->timeout.timer.tv_sec = TIMEOUT;
+        node->garbage.timer.tv_sec = GARBAGE;
+        set_time(&node->timeout, &node->timeout.timer_thread);   //re-init the timer thread for timeout
+    }
+
+    
 }
 
 void add_route_table(struct ripEntry *re, int nexthop, int iface, int cost)
@@ -322,12 +436,19 @@ void add_route_table(struct ripEntry *re, int nexthop, int iface, int cost)
     {
 
 
-        if(item->metric == re->metric + 1) 
+        if(item->metric == re->metric + cost) 
         {
 
-            log_handler("ID:%d metric is the same, do nothing\n", re->destination);
+           
             item->timeout.timer.tv_sec = TIMEOUT;   //renew the timeout 
             item->flag = false;
+
+            if (item->garbage.valid)
+            {
+                log_handler("Receiving valid updates, cancel garbaging\n");
+                item->garbage.valid = false;
+            }
+            else  log_handler("ID:%d metric is the same, do nothing\n", re->destination);
             
         }
         else
@@ -338,11 +459,18 @@ void add_route_table(struct ripEntry *re, int nexthop, int iface, int cost)
                 if (re->metric + cost >= MAX_HOP + 1)
                 {                    
                     item->metric = MAX_HOP + 1;
+                    triggered_update(item);
                     item->timeout.timer.tv_sec = 0;
                     item->flag = true;
                 }
                 else 
                 {
+                    if (item->garbage.valid)
+                    {
+                        log_handler("Receiving valid updates, cancel garbaging\n");
+                        item->garbage.valid = false;
+                    }
+
                     item->metric = re->metric + cost;
                     item->next_hop = nexthop;
                     item->iface = iface;
@@ -363,7 +491,6 @@ void add_route_table(struct ripEntry *re, int nexthop, int iface, int cost)
         node->next_hop = nexthop;
         node->iface = iface;
         node->flag = true;
-        node->valid = true;
         node->next = NULL;
         node->metric = re->metric + cost;   
 
@@ -375,11 +502,12 @@ void add_route_table(struct ripEntry *re, int nexthop, int iface, int cost)
         //node->timerdata.timer = &node->timeout;
         node->timeout.fun_ptr = &route_table_timeout;
         node->timeout.args = node; 
+        node->timeout.valid = true;
 
         node->garbage.timer.tv_sec = GARBAGE;
         node->garbage.fun_ptr = &garbage_collect;
         node->garbage.args = &node->address; 
-
+        node->garbage.valid = false;
 
         set_time(&node->timeout, &node->timeout.timer_thread);
         log_handler("Adding %d to timeout timer, route pointer is %d:\n", node->address, node);
@@ -389,8 +517,7 @@ void add_route_table(struct ripEntry *re, int nexthop, int iface, int cost)
 
 
     pthread_mutex_unlock(&write_route_table);       //unlock
- 
-    
+   
 
 }
 
@@ -447,35 +574,7 @@ void decode_packet(char* packet, int size, struct Interface* interface)
 
 
 
-void generate_update(struct packet *msg, int nexthop) 
-{ 
-    struct ripHeader rh;
-    struct ripEntry re;
-    rh.command = COMMAND;
-    rh.version = VERSION;
-    rh.routerid = self.routerid;
-    packet_header(msg, rh);
 
-    re.addrfamily = ADDRFAMILY;
-    re.zero = 0;
-    re.zero1 = 0;
-    re.zero2 = 0;
-    /*re.destination = self.routerid;
-    re.metric = 0;
-    packet_entry(msg, re);*/
-
-    struct Route_Table *item = routetable;
-    while(item != NULL)
-    {
-        if (item->next_hop != nexthop) re.metric = item->metric;
-        else re.metric = MAX_HOP + 1;    //poison reverse
-        re.destination = item->address;
-        packet_entry(msg, re);
-
-        item = item->next;
-    }
-
-} 
 
 
 
@@ -787,51 +886,6 @@ void print_bytes(unsigned char *bytes, size_t num_bytes) {
 }
 
 
-void send_update(struct Interface *interface)
-{
-    int rc;
-    struct sockaddr_in remote; 
-
-
-    remote.sin_family = AF_INET;          /* communicate using internet address */
-    remote.sin_addr.s_addr = INADDR_ANY; /* accept all calls                   */
-    
-    
-    struct packet msg;
-    msg.size = 0;
-
-    if (interface->found_peer) 
-    {
-        remote.sin_port = htons(interface->neighbor->port);    /* this is port number  */
-        generate_update(&msg, interface->neighbor->routerid) ;
-        rc = sendto(interface->sockfd, msg.message, msg.size, 0, (struct sockaddr *)&remote, sizeof(remote));
-        //int rc = sendto(interface->sockfd, "update", 6, 0, (struct sockaddr *)&remote, sizeof(remote));
-        if (rc == -1) {
-            perror("sendto error");
-        }
-    }
-    else 
-    {
-
-        generate_update(&msg, -1) ;
-        for(int i = 0; i < self.output_number; i++)
-        {
-            remote.sin_port = htons(self.output[i].port);    /* this is port number  */
-            rc = sendto(interface->sockfd, msg.message, msg.size, 0, (struct sockaddr *)&remote, sizeof(remote));
-            //int rc = sendto(interface->sockfd, "update", 6, 0, (struct sockaddr *)&remote, sizeof(remote));
-            if (rc == -1) {
-                perror("sendto error");
-            }
-            //print_bytes(msg.message, msg.size);
-        }
-
-    }
-    //printf("message is  %s , %d\n", message); 
-    //print_bytes(msg.message, msg.size);
-
-}
-
-
 void print_route_table()
 {
     printf("\n=======Route Table=======\n");
@@ -867,7 +921,7 @@ void* update_process()
     {
         for (int i = 0; i < self.input_number; i++)
         {
-            send_update(&self.input[i]);
+            send_update(&self.input[i], NULL);
         }
         print_route_table();
         srand(time(NULL) + self.routerid);
@@ -878,7 +932,6 @@ void* update_process()
     }
     pthread_exit(0);
 }
-
 
 
 
