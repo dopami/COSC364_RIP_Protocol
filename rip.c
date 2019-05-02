@@ -89,9 +89,9 @@ pthread_mutex_t write_route_table;
 
 
 struct ripHeader {
-  byte command; 		/* 1-REQUEST, 2-RESPONSE */
+  byte command; 		// 1-REQUEST, 2-RESPONSE 
   byte version;
-  short int zero;
+  short int routerid;       // it should be zero, but we used as router-id
 };
 
 
@@ -113,6 +113,14 @@ struct packet
 
 
 //=============================================================
+
+void exit_program()
+{
+    free(self.input);
+    free(self.output);
+
+    exit(0);
+}
 
 void log_handler(const char *fmt, ...)
 {
@@ -290,7 +298,7 @@ void route_table_timeout(void* args)
             }
 }
 
-void add_route_table(struct ripEntry *re, int nexthop, int iface)
+void add_route_table(struct ripEntry *re, int nexthop, int iface, int cost)
 {
     //check metric
 
@@ -331,10 +339,10 @@ void add_route_table(struct ripEntry *re, int nexthop, int iface)
         }
         else
         {
-            if ((item->next_hop == nexthop) || (item->next_hop != nexthop && item->metric > re->metric))
+            if ((item->next_hop == nexthop) || (item->next_hop != nexthop && item->metric > re->metric + cost))
             {
                 log_handler("Changing %d in routetable:\n", re->destination);
-                if (re->metric >= MAX_HOP)
+                if (re->metric + cost >= MAX_HOP + 1)
                 {                    
                     item->metric = MAX_HOP + 1;
                     item->timeout.tv_sec = 0;
@@ -342,7 +350,7 @@ void add_route_table(struct ripEntry *re, int nexthop, int iface)
                 }
                 else 
                 {
-                    item->metric = re->metric + 1;
+                    item->metric = re->metric + cost;
                     item->next_hop = nexthop;
                     item->iface = iface;
                     item->flag = true;
@@ -354,7 +362,7 @@ void add_route_table(struct ripEntry *re, int nexthop, int iface)
         }
     }
 
-    else if (re->metric < MAX_HOP)
+    else if (re->metric + cost <= MAX_HOP)
     {   
         log_handler("Adding %d to routetable:\n", re->destination);
         struct Route_Table *node = (struct Route_Table*)malloc(sizeof(struct Route_Table));
@@ -366,7 +374,7 @@ void add_route_table(struct ripEntry *re, int nexthop, int iface)
         node->next = NULL;
 
         node->timeout.tv_sec = TIMEOUT; 
-        node->metric = re->metric + 1;       
+        node->metric = re->metric + cost;       
 
 
         log_handler("Adding %d to timeout timer, route pointer is %d:\n", node->address, node);
@@ -389,17 +397,17 @@ void add_route_table(struct ripEntry *re, int nexthop, int iface)
 
 
 
-bool rip_head_validation(struct ripHeader *rh)
+bool rip_head_validation(struct ripHeader *rh, int remoteid)
 {
     //log_handler("rip head: %d, %d, %d\n", rh->command == COMMAND , rh->version == VERSION , rh->zero == 0);
-    return (rh->command == COMMAND && rh->version == VERSION && rh->zero == 0);
+    return (rh->command == COMMAND && rh->version == VERSION && rh->routerid > 0 && rh->routerid <= 64000 && rh->routerid == remoteid);
 }
 bool rip_entry_validation(struct ripEntry *re)
 {
     return (re->addrfamily == ADDRFAMILY && re->zero == 0 && re->zero1 == 0 && re->zero2 == 0 && re->metric <= MAX_HOP + 1);
 }
 
-void decode_packet(char* packet, int size, int nexthop, int iface)
+void decode_packet(char* packet, int size, struct Interface* interface)
 {
     struct ripHeader rh;
     struct ripEntry re;
@@ -412,7 +420,7 @@ void decode_packet(char* packet, int size, int nexthop, int iface)
     {
         memcpy(&rh, (void*)packet, sizeof(rh));
 
-        if (!rip_head_validation(&rh))
+        if (!rip_head_validation(&rh, interface->neighbor->routerid))
         {
             log_handler("head invalid, drop it\n");
         }
@@ -421,14 +429,14 @@ void decode_packet(char* packet, int size, int nexthop, int iface)
             while (size - i > 0)
             {
                 memcpy(&re, (void*)packet + i, sizeof(re));
-                log_handler("GET ADDRESS: %d, metric: %d, next_hop: %d\n", re.destination, re.metric, nexthop);
+                log_handler("GET ADDRESS: %d, metric: %d, next_hop: %d\n", re.destination, re.metric, rh.routerid);
                 if (!rip_entry_validation(&re))
                 {
                     log_handler("metric out of range, drop\n");
                 }
                 else 
                 {
-                    add_route_table(&re, nexthop, iface);
+                    add_route_table(&re, rh.routerid, interface->port, interface->neighbor->metric);
                 }
                 i += sizeof(re);
             }
@@ -445,7 +453,7 @@ void generate_update(struct packet *msg, int nexthop)
     struct ripEntry re;
     rh.command = COMMAND;
     rh.version = VERSION;
-    rh.zero = 0;
+    rh.routerid = self.routerid;
     packet_header(msg, rh);
 
     re.addrfamily = ADDRFAMILY;
@@ -497,6 +505,23 @@ void init()
 }
 
 
+bool check_port(int port)
+{
+    return (port >= 1024 && port <= 64000);
+}
+
+bool check_routerid(int routerid)
+{
+    return (routerid > 0 && routerid <= 64000);
+}
+
+bool check_metric(int metric)
+{
+    return (metric >= 0 && metric <= 16);
+}
+
+
+
 int readConfig(char *cfg_file, struct ConfigItem *item)
 {
 
@@ -505,6 +530,8 @@ int readConfig(char *cfg_file, struct ConfigItem *item)
     size_t len = 0;
     char *name = NULL;
     char *content = NULL;
+    char *content_collect = NULL;
+    int n = 1;
 
     FILE *fp = fopen(cfg_file, "r");
     
@@ -527,6 +554,7 @@ int readConfig(char *cfg_file, struct ConfigItem *item)
                 //init
                 name = (char*)malloc(sizeof(char) * (mark - line + 1));
                 content = (char*)malloc(sizeof(char) * (len - (mark - line) + 1));
+                content_collect = content;
                 memset(name, '\0', mark - line + 1);
                 memset(content, '\0', (len - (mark - line) + 1)); 
 
@@ -534,69 +562,97 @@ int readConfig(char *cfg_file, struct ConfigItem *item)
                 strcpy(content, mark + 1);
 
 
-                if (strcmp(name,configName[0]) == 0)
+                if (strcmp(name,configName[0]) == 0)               //router-id field
                 {
                     if (item->routerid_status)
                     {
-                        log_handler("WARNING: Duplicate router-id found!! check config file\n");
+                        log_handler("WARNING: Duplicate router-id found at line %d!\n", n);
+                    }  
+                    else if (!check_routerid(atoi(content)))
+                    {
+                        log_handler("ERROR: router-id invalid at line %d\n", n);
+                        exit_program();
                     }
                     else
                     {
-
-                        item->routerid = atoi(content);
+                        item->routerid = atoi(content); 
                         item->routerid_status = true;
-                        printf("router-id is : %d\n", item->routerid);                        
+                        log_handler("router-id is : %d\n", item->routerid);                        
                     }
                     
                 }
-                else if (strcmp(name, configName[1]) == 0)
+                else if (strcmp(name, configName[1]) == 0)         //input field
                 {
                     char *ptr;
                     while ((ptr = strtok(content, ",")) != NULL)
                     {
-                        item->input_number++;
-                        item->input = (struct Interface*)realloc(item->input, sizeof(struct Interface) * item->input_number);
-                        if (item->input == NULL)
+                        if(!check_port(atoi(ptr)))
                         {
-                            log_handler("realloc error/n/n");
+                            log_handler("ERROR: port invalid at line %d\n", n);
+                            exit_program();
                         }
-                        item->input[item->input_number - 1].port = atoi(ptr); 
-                        item->input[item->input_number - 1].neighbor = NULL;
-                        item->input[item->input_number - 1].found_peer = false;
-                        item->input[item->input_number - 1].sockfd = 0;
-                        content = NULL;
+                        else
+                        {
+                            item->input_number++;
+                            item->input = (struct Interface*)realloc(item->input, sizeof(struct Interface) * item->input_number);
+                            if (item->input == NULL)
+                            {
+                                log_handler("realloc error/n/n");
+                            }
+                            item->input[item->input_number - 1].port = atoi(ptr); 
+                            item->input[item->input_number - 1].neighbor = NULL;
+                            item->input[item->input_number - 1].found_peer = false;
+                            item->input[item->input_number - 1].sockfd = 0;
+                            content = NULL;
 
-                        log_handler("INPUT:%d\n", item->input[item->input_number - 1].port);
+                            log_handler("INPUT:%d\n", item->input[item->input_number - 1].port);
+                        }
+
                     }
 
                 }
-                else if (strcmp(name, configName[2]) == 0)
+                else if (strcmp(name, configName[2]) == 0)         //output field
                 {
                     char *ptr;
                     while ((ptr = strtok(content, ",")) != NULL)
                     {
                         char *dash;
                         char temp[8];
-                        memset(temp, '\0', sizeof(temp));
-
+                        
                         item->output_number++;
                         item->output = (struct Peer*)realloc(item->output, sizeof(struct Peer) * item->output_number);
                         
-
+                        memset(temp, '\0', sizeof(temp));            //read peer port
                         dash = strchr(ptr, '-');
                         strncpy(temp, ptr, dash - ptr);
+                        if (!check_port(atoi(temp)))
+                        {
+                            log_handler("ERROR: port invalid at line %d\n", n);
+                            exit_program();
+                        }
+                        
                         item->output[item->output_number - 1].port = atoi(temp);
 
-                        memset(temp, '\0', sizeof(temp));
-
-                        ptr = dash + 1;
+                        memset(temp, '\0', sizeof(temp));            //read peer metric
+                        ptr = dash + 1;                             
                         dash = strchr(ptr, '-');
                         strncpy(temp, ptr, dash - ptr);
+                        if (!check_metric(atoi(temp)))
+                        {
+                            log_handler("ERROR: metric invalid at line %d\n", n);
+                            exit_program();
+                        }
                         item->output[item->output_number - 1].metric = atoi(temp);
 
-                        memset(temp, '\0', sizeof(temp));
+                        memset(temp, '\0', sizeof(temp));           //read peer router-id 
                         strcpy(temp, dash + 1);
+                        if (!check_routerid(atoi(temp)))
+                        {
+                            log_handler("ERROR: router-id invalid at line %d\n", n);
+                            exit_program();
+                        }
                         item->output[item->output_number - 1].routerid = atoi(temp);
+
 
                         content = NULL;
                         log_handler("OUTPUT: port: %d, metric: %d, peer: %d\n",  
@@ -608,14 +664,14 @@ int readConfig(char *cfg_file, struct ConfigItem *item)
                 }
 
                 free(name);
-                free(content);
+                free(content_collect);
             }
             
         }
+
+        n++;   //line number
  
     }
-
-    //cleanup
 
     free(line);
     fclose(fp);
@@ -707,7 +763,7 @@ void listen_port(struct Interface *interface)
                         interface->neighbor = peer;
                         interface->found_peer = true;
 
-                        decode_packet(buf, rc, interface->neighbor->routerid,interface->port);
+                        decode_packet(buf, rc, interface);
                         
                     }
                 }
@@ -815,6 +871,7 @@ void* update_process()
             send_update(&self.input[i]);
         }
         print_route_table();
+        srand(time(NULL) + self.routerid);
         int r = rand() % (UPDATE * 1000000 / 6);
         log_handler("random sleep %d\n", r);
         usleep(r);               //random update
@@ -828,12 +885,9 @@ void* update_process()
 
 
 
-void fun(void* args) 
-{ 
-    int *a = (int*) args;
-    log_handler("function called success %d \n", *a); 
 
-} 
+
+
 
 
 int main(int argc, char **argv) 
@@ -854,19 +908,7 @@ int main(int argc, char **argv)
     
     routetable->address = self.routerid;
 
-    int a = 12345;
-    struct timeval temp_timer;
-    temp_timer.tv_sec = 5;
-    temp_timer.tv_usec = 0;
-/*
-    struct Timer_Struct timerdata;    //initial passing args
-    timerdata.timer = &temp_timer;
-    timerdata.fun_ptr = &fun;
-    timerdata.args = &a;
-    
-    pthread_t timer_thread; 
-    set_time(&timerdata, &timer_thread);
-*/
+
     
     for(int i=0; i<self.input_number; i++)
     {
@@ -902,10 +944,8 @@ int main(int argc, char **argv)
     }
 
     
-
-    free(self.input);
-    free(self.output);
-    return 0;
+    exit_program();       //free resources, exit threads, then exit the program
+    return 0;    
 }
 
 
