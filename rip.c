@@ -62,25 +62,27 @@ struct ConfigItem
 
 struct Timer_Struct
 {
-    struct timeval *timer;
+    struct timeval timer;
     void (*fun_ptr)();
     void *args;
-    bool *cancel;      //necessary?
+    pthread_t timer_thread;    //the PID of timer threads which we can easily manage the timer
+    bool cancel;      //necessary?
 };
 
 struct Route_Table
 {   
-    struct Route_Table *next;
-    int address;
+    struct Route_Table *next;    //linked-list with structure node
+    int address;                 //dest address
     uint32_t metric;
     int next_hop;
-    bool flag;
-    struct timeval timeout;
-    struct timeval garbage;
-    int iface;
-    bool valid;
-    pthread_t timer_thread;
-    struct Timer_Struct timerdata;
+    bool flag;                  //mark to trigger update
+    struct Timer_Struct timeout;
+    struct Timer_Struct garbage;
+    int iface;                  //the interface to next hop
+    bool valid;          //mark the garbage period, 
+                         //if receive good msg while invalid, cancel the garbage handler and re-init the timer
+    
+    //struct Timer_Struct timerdata;
 }*routetable;
 
 pthread_mutex_t write_route_table;
@@ -141,21 +143,21 @@ void log_handler(const char *fmt, ...)
 void* time_handler(void *args)
 {
     struct Timer_Struct *timerdata = (struct Timer_Struct *)args;  //formating the passing args
-    log_handler("Starting Timer, %d\n", timerdata->timer->tv_sec);       //debug
+    log_handler("Starting Timer, %d\n", timerdata->timer.tv_sec);       //debug
     time_t nowtime, starttime;        //set time stamp
 
     
           //remember start time
-    while (timerdata->timer->tv_sec > 0)
+    while (timerdata->timer.tv_sec > 0)
     {
         //log_handler("Time left %d\n", timerdata->timer->tv_sec);
 
         time(&starttime); 
         sleep(1);         //wait 1 second
         time(&nowtime);   //check current time
-        if (timerdata->timer->tv_sec > nowtime - starttime)
-            timerdata->timer->tv_sec -= nowtime - starttime;
-        else timerdata->timer->tv_sec = 0;
+        if (timerdata->timer.tv_sec > nowtime - starttime)
+            timerdata->timer.tv_sec -= nowtime - starttime;
+        else timerdata->timer.tv_sec = 0;
         //log_handler("time still left:%d \n", timerdata->timer->tv_sec);
     }
     (timerdata->fun_ptr)(timerdata->args);       //call the function
@@ -173,7 +175,7 @@ void set_time(struct Timer_Struct *timerdata, pthread_t *timer_thread)
     timerdata.args = args;*/
 
 
-    log_handler("Set Timer %d\n", timerdata->timer->tv_sec); 
+    log_handler("Set Timer %d\n", timerdata->timer.tv_sec); 
     if (pthread_create(timer_thread,NULL,time_handler,timerdata) != 0) //create timer thread
     {
             perror("TimeHandler");
@@ -278,20 +280,11 @@ void route_table_timeout(void* args)
     */
 
     node->metric = MAX_HOP + 1;
-    node->garbage.tv_sec = GARBAGE;
-
-    struct Timer_Struct timerdata;    //initial passing args
-    timerdata.timer = &node->garbage;
-    timerdata.fun_ptr = &garbage_collect;
-    timerdata.args = &node->address; 
-
     pthread_mutex_unlock(&write_route_table);     //unlock
-
-
-    pthread_t timer_thread;     
-    set_time(&timerdata, &timer_thread);
-    log_handler("Setting timer %d for garbage collection %d\n", node->garbage, node->address);
-    if (pthread_join(timer_thread, NULL) != 0) 
+    
+    set_time(&node->garbage, &node->garbage.timer_thread);
+    log_handler("Setting timer %d for garbage collection %d\n", node->garbage.timer, node->address);
+    if (pthread_join(node->garbage.timer_thread, NULL) != 0) 
             {
                 perror("pthread_join");
                 exit(1);
@@ -333,7 +326,7 @@ void add_route_table(struct ripEntry *re, int nexthop, int iface, int cost)
         {
 
             log_handler("ID:%d metric is the same, do nothing\n", re->destination);
-            item->timeout.tv_sec = TIMEOUT;   //renew the timeout 
+            item->timeout.timer.tv_sec = TIMEOUT;   //renew the timeout 
             item->flag = false;
             
         }
@@ -345,7 +338,7 @@ void add_route_table(struct ripEntry *re, int nexthop, int iface, int cost)
                 if (re->metric + cost >= MAX_HOP + 1)
                 {                    
                     item->metric = MAX_HOP + 1;
-                    item->timeout.tv_sec = 0;
+                    item->timeout.timer.tv_sec = 0;
                     item->flag = true;
                 }
                 else 
@@ -355,7 +348,7 @@ void add_route_table(struct ripEntry *re, int nexthop, int iface, int cost)
                     item->iface = iface;
                     item->flag = true;
 
-                    item->timeout.tv_sec = TIMEOUT;   //renew the timeout 
+                    item->timeout.timer.tv_sec = TIMEOUT;   //renew the timeout 
                 }
             }
 
@@ -372,17 +365,24 @@ void add_route_table(struct ripEntry *re, int nexthop, int iface, int cost)
         node->flag = true;
         node->valid = true;
         node->next = NULL;
-
-        node->timeout.tv_sec = TIMEOUT; 
-        node->metric = re->metric + cost;       
+        node->metric = re->metric + cost;   
 
 
+        node->timeout.timer.tv_sec = TIMEOUT; 
+        
+ 
+
+        //node->timerdata.timer = &node->timeout;
+        node->timeout.fun_ptr = &route_table_timeout;
+        node->timeout.args = node; 
+
+        node->garbage.timer.tv_sec = GARBAGE;
+        node->garbage.fun_ptr = &garbage_collect;
+        node->garbage.args = &node->address; 
+
+
+        set_time(&node->timeout, &node->timeout.timer_thread);
         log_handler("Adding %d to timeout timer, route pointer is %d:\n", node->address, node);
-         //initial passing args
-        node->timerdata.timer = &node->timeout;
-        node->timerdata.fun_ptr = &route_table_timeout;
-        node->timerdata.args = node; 
-        set_time(&node->timerdata, &node->timer_thread);
 
         prior->next = node;
     }    
@@ -668,7 +668,6 @@ int readConfig(char *cfg_file, struct ConfigItem *item)
             }
             
         }
-
         n++;   //line number
  
     }
@@ -842,7 +841,7 @@ void print_route_table()
     {
         char flag = 'N';
         if (item->flag) flag = 'Y';
-        printf("%-10d%-10d%-10d%-10c%-10d%-10d%-10d%-10d\n",item->address, item->metric, item->next_hop, flag, item->iface, item->timeout.tv_sec, item->garbage.tv_sec, item);
+        printf("%-10d%-10d%-10d%-10c%-10d%-10d%-10d%-10d\n",item->address, item->metric, item->next_hop, flag, item->iface, item->timeout.timer.tv_sec, item->garbage.timer.tv_sec, item);
 
         item = item->next;
     }
