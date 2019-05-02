@@ -1,7 +1,7 @@
 /*
 Use gcc rip.c -o rip -lpthread to compile
 
-
+Author: Ran Bi
 
 */
 
@@ -17,10 +17,9 @@ Use gcc rip.c -o rip -lpthread to compile
 #include <signal.h>
 #include <sys/select.h>
 #include <stdarg.h>
-
 #include <fcntl.h>
 
-#define BUF_SIZE 1024
+#define BUF_SIZE 1500
 #define MAX_HOP 15
 #define UPDATE 5
 #define TIMEOUT UPDATE*6
@@ -327,6 +326,7 @@ void add_route_table(struct ripEntry *re, int nexthop, int iface)
 
             log_handler("ID:%d metric is the same, do nothing\n", re->destination);
             item->timeout.tv_sec = TIMEOUT;   //renew the timeout 
+            item->flag = false;
             
         }
         else
@@ -338,6 +338,7 @@ void add_route_table(struct ripEntry *re, int nexthop, int iface)
                 {                    
                     item->metric = MAX_HOP + 1;
                     item->timeout.tv_sec = 0;
+                    item->flag = true;
                 }
                 else 
                 {
@@ -365,8 +366,7 @@ void add_route_table(struct ripEntry *re, int nexthop, int iface)
         node->next = NULL;
 
         node->timeout.tv_sec = TIMEOUT; 
-        node->metric = re->metric + 1;
-        
+        node->metric = re->metric + 1;       
 
 
         log_handler("Adding %d to timeout timer, route pointer is %d:\n", node->address, node);
@@ -815,7 +815,10 @@ void* update_process()
             send_update(&self.input[i]);
         }
         print_route_table();
-        sleep (UPDATE);
+        int r = rand() % (UPDATE * 1000000 / 6);
+        log_handler("random sleep %d\n", r);
+        usleep(r);               //random update
+        sleep (UPDATE);          
     }
     pthread_exit(0);
 }
