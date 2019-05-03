@@ -40,6 +40,10 @@ char *configName[] =  {"router-id", "input-ports", "outputs"};
 
 bool showlog = false;
 bool gracequit = false;
+pthread_mutex_t screen;   //display will not be interrupted
+
+pthread_mutex_t write_route_table;  //protect route_table so only one thread can access at a time
+
 
 //============== Global Variables ============================
 
@@ -91,7 +95,6 @@ struct Route_Table
                      
 }*routetable;
 
-pthread_mutex_t write_route_table;  //protect route_table so only one thread can access at a time
 
 
 
@@ -137,13 +140,17 @@ void log_handler(const char *fmt, ...)
         time(&t);
         struct tm *tmp_time = localtime(&t);
         char s[100];
+
+        pthread_mutex_lock(&screen);
+
         strftime(s, sizeof(s), "%04Y%02m%02d-%H:%M:%S", tmp_time);
         printf("[LOG-%s]: ", s);
-
         va_list ap;
         va_start(ap, fmt);
         vprintf(fmt, ap);
         va_end(ap);
+
+        pthread_mutex_unlock(&screen);
     }
 }
 
@@ -591,7 +598,7 @@ void init()
     routetable->flag = false;
 
     pthread_mutex_t write_route_table = PTHREAD_MUTEX_INITIALIZER;
-
+    pthread_mutex_t screen = PTHREAD_MUTEX_INITIALIZER;
 }
 
 
@@ -812,7 +819,7 @@ void listen_port(struct Interface *interface)
 
 
 
-    while(1) 
+    while(!gracequit) 
     {
         FD_ZERO(&recvfd);        
         FD_SET(interface->sockfd, &recvfd); 
@@ -880,7 +887,8 @@ void print_bytes(unsigned char *bytes, size_t num_bytes) {
 
 void print_route_table()
 {
-    printf("\n=======Route Table=======\n");
+    pthread_mutex_lock(&screen);
+    printf("\n============  Route Table  ==============\n");
     printf("%-10s%-10s%-10s%-10s%-10s%-10s%-10s%-10s\n","Dest", "Metric", "NextHop", "ChgFlag", "Iface", "Timeout", "Garbage", "Pointer");
     struct Route_Table *item = routetable->next;
     while(item != NULL)
@@ -891,7 +899,8 @@ void print_route_table()
 
         item = item->next;
     }
-    printf("=======Route Table END=======\n");
+    printf("============  Route Table END  ============\n");
+    pthread_mutex_unlock(&screen);
 }
 
 void* listen_process(void *argv)
@@ -927,15 +936,51 @@ void* update_process()
 }
 
 
-void CLI_daemon()
+void* CLI_daemon()
 {
-    while(1)
+    printf("Router_%d>",self.routerid);
+    while(!gracequit)
     {
+        char cli_command[128];
+        fgets(cli_command, 128, stdin);
+        pthread_mutex_lock(&screen);
+        if (strcmp(cli_command, "terminal monitor\n") == 0) 
+        {
+            showlog = true;
+            printf("Logging displays Enable\n");
+        }
+        else if (strcmp(cli_command, "terminal no monitor\n") == 0) 
+        {
+            showlog = false;
+            printf("Logging displays Disable\n");
+        }
+        else if (strcmp(cli_command, "exit\n") == 0) 
+        {
+            gracequit = true;
+            printf("Shutting Down\n");
+        }
+        else if (strcmp(cli_command, "show config\n") == 0) 
+        {
+            printf("Router id: %d\n", self.routerid);
+            printf("Input UDP Number: ");
+            for (int i = 0; i < self.input_number; i++)
+            {
+                printf("%d ",self.input[i].port);
+            }
+            printf("\n");
+            printf("Neighbors:\n");
 
+        }
+        else if (strcmp(cli_command, "\n") != 0)
+        {
+            printf("Unknown command %s, use help\n", cli_command);
+        }
+
+
+        printf("Router_%d>",self.routerid);
+        pthread_mutex_unlock(&screen);
     }
 }
-
-
 
 
 
@@ -946,6 +991,7 @@ int main(int argc, char **argv)
 
     pthread_t listener[self.input_number];   //create PIDs
     pthread_t updater;
+    pthread_t cli;
 
     init();
 
@@ -958,6 +1004,13 @@ int main(int argc, char **argv)
     readConfig(argv[1], &self);
     
     routetable->address = self.routerid;
+
+
+    if (pthread_create(&cli,NULL,CLI_daemon, NULL) != 0)
+        {
+            perror("create");
+            exit(1);
+        }
 
 
     
@@ -985,6 +1038,8 @@ int main(int argc, char **argv)
             exit(1);
         }
 
+    
+
 
     for(int i=0; i<self.input_number; i++)
     {
@@ -993,6 +1048,13 @@ int main(int argc, char **argv)
             exit(1);
         }
     }
+
+    if (pthread_join(cli, NULL) != 0) {
+            perror("pthread_join");
+            exit(1);
+    }
+
+
 
     
     exit_program();       //free resources, exit threads, then exit the program
