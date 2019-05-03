@@ -41,8 +41,7 @@ char *configName[] =  {"router-id", "input-ports", "outputs"};
 bool showlog = false;
 bool gracequit = false;
 pthread_mutex_t screen;   //display will not be interrupted
-
-pthread_mutex_t write_route_table;  //protect route_table so only one thread can access at a time
+pthread_mutex_t access_route_table;  //protect route_table so only one thread can access at a time
 
 
 //============== Global Variables ============================
@@ -80,6 +79,7 @@ struct Timer_Struct
     void *args;
     pthread_t timer_thread;    //the PID of timer threads which we can easily manage the timer
     bool valid;      //if receive good msg while invalid, cancel the garbage handler and re-init the timer
+    pthread_mutex_t change_time;
 };
 
 struct Route_Table
@@ -124,7 +124,7 @@ struct packet
 
 //=============================================================
 
-void exit_program()
+void exit_program()                        //release all resources, wait for thread end, free memory
 {
     free(self.input);
     free(self.output);
@@ -132,7 +132,7 @@ void exit_program()
     exit(0);
 }
 
-void log_handler(const char *fmt, ...)
+void log_handler(const char *fmt, ...)     //just like printf, but add time tag and switch on/off
 {
     if (showlog)
     {
@@ -141,41 +141,35 @@ void log_handler(const char *fmt, ...)
         struct tm *tmp_time = localtime(&t);
         char s[100];
 
-        pthread_mutex_lock(&screen);
+        pthread_mutex_lock(&screen);       //if no one is outputing to screen, start print log
 
         strftime(s, sizeof(s), "%04Y%02m%02d-%H:%M:%S", tmp_time);
-        printf("[LOG-%s]: ", s);
+        printf("[LOG-%s]: ", s);          //log head with time tag
         va_list ap;
         va_start(ap, fmt);
-        vprintf(fmt, ap);
+        vprintf(fmt, ap);                 //print log body with format variables
         va_end(ap);
 
-        pthread_mutex_unlock(&screen);
+        pthread_mutex_unlock(&screen);     //release lock
     }
 }
 
 void* time_handler(void *args)
 {
     struct Timer_Struct *timerdata = (struct Timer_Struct *)args;  //formating the passing args
-    log_handler("Starting Timer, %d\n", timerdata->timer.tv_sec);       //debug
-    time_t nowtime, starttime;        //set time stamp
+    log_handler("Starting Timer, %d\n", timerdata->timer.tv_sec); 
 
     
-          //remember start time
-    while (timerdata->timer.tv_sec > 0 && timerdata->valid)
+    while (timerdata->timer.tv_sec > 0 && timerdata->valid)  //if we don't need to cancel the timer, or time still left
     {
-        //log_handler("Time left %d\n", timerdata->timer->tv_sec);
-
-        time(&starttime); 
-        sleep(1);         //wait 1 second
-        time(&nowtime);   //check current time
-        if (timerdata->timer.tv_sec > nowtime - starttime)
-            timerdata->timer.tv_sec -= nowtime - starttime;
-        else timerdata->timer.tv_sec = 0;
-        //log_handler("time still left:%d \n", timerdata->timer->tv_sec);
+        log_handler("time left %d\n", timerdata->timer.tv_sec);
+        pthread_mutex_lock(&timerdata->change_time);    
+        timerdata->timer.tv_sec --;   //adjust timer
+        pthread_mutex_unlock(&timerdata->change_time); 
+        sleep(1);         //wait 1 second 
     }
 
-    if (timerdata->valid)  (timerdata->fun_ptr)(timerdata->args);       //call the function
+    if (timerdata->valid)  (timerdata->fun_ptr)(timerdata->args);       //if we don't need to cancel the timer, call the function
     
     pthread_exit(0);                      //exit thread
 
@@ -233,13 +227,12 @@ void generate_update(struct packet *msg, int nexthop, struct Route_Table *node)
     re.zero = 0;
     re.zero1 = 0;
     re.zero2 = 0;
-    /*re.destination = self.routerid;
-    re.metric = 0;
-    packet_entry(msg, re);*/
 
     if (node == NULL)  //regular update
     {
         struct Route_Table *item = routetable;
+
+        
         while(item != NULL)
         {
             if (item->next_hop != nexthop) re.metric = item->metric;
@@ -251,10 +244,11 @@ void generate_update(struct packet *msg, int nexthop, struct Route_Table *node)
         }
     }
     else   //triggered update
-    {
+    { 
         if (node->next_hop != nexthop) re.metric = node->metric;
         else re.metric = MAX_HOP + 1;    //poison reverse
-        re.destination = node->address;
+        re.destination = node->address; 
+
         packet_entry(msg, re);
     }
 
@@ -281,8 +275,8 @@ void send_update(struct Interface *interface, struct Route_Table *node)
         generate_update(&msg, interface->neighbor->routerid, node) ;
         pthread_mutex_lock(&interface->send_socket);
         rc = sendto(interface->sockfd, msg.message, msg.size, 0, (struct sockaddr *)&remote, sizeof(remote));
-        pthread_mutex_unlock(&interface->send_socket);
-        //int rc = sendto(interface->sockfd, "update", 6, 0, (struct sockaddr *)&remote, sizeof(remote));
+        pthread_mutex_unlock(&interface->send_socket);  
+        log_handler("Sending msg to %d from port %d\n", interface->neighbor->routerid, interface->port);      
         if (rc == -1) {
             perror("sendto error");
         }
@@ -297,16 +291,16 @@ void send_update(struct Interface *interface, struct Route_Table *node)
             pthread_mutex_lock(&interface->send_socket);
             rc = sendto(interface->sockfd, msg.message, msg.size, 0, (struct sockaddr *)&remote, sizeof(remote));
             pthread_mutex_unlock(&interface->send_socket);
-            //int rc = sendto(interface->sockfd, "update", 6, 0, (struct sockaddr *)&remote, sizeof(remote));
+            
             if (rc == -1) {
                 perror("sendto error");
             }
-            //print_bytes(msg.message, msg.size);
         }
+        log_handler("Sending all route entries from port %d\n", interface->port);
 
     }
-    //printf("message is  %s , %d\n", message); 
-    //print_bytes(msg.message, msg.size);
+    
+
 
 }
 
@@ -324,62 +318,57 @@ void triggered_update(struct Route_Table *node)
 
 void garbage_collect(void* args)
 {
-    int *address = (int*) args;
+    struct Route_Table *node = (struct Route_Table*) args;
 
     //check metric
-    log_handler("ID:%d, Deleting route table entry\n", *address);
+    log_handler("ID:%d, Deleting route table entry\n", node->address);
     //scan routetable
     struct Route_Table *item, *prior;
 
-    pthread_mutex_lock(&write_route_table);   //lock
-
-
+    pthread_mutex_lock(&access_route_table);   //lock
     item = routetable;
-    prior = item;
-    bool found = false;
-    
+    prior = item;    
     do
     {
-        if(&item->address == address)
+        if(item == node)
         {
-            found = true;
-            prior->next = item->next;
-            free(item);
+
+            prior->next = node->next;
+            free(node);
             break;
         }
         prior = item;
         item = item->next;
-        
     }while (item != NULL);
+    pthread_mutex_unlock(&access_route_table);   //unlock
 
-
-    pthread_mutex_unlock(&write_route_table);   //unlock
+    log_handler("Route table entry deleted\n");
 }
 
 
 void route_table_timeout(void* args)
 {
 
-    //int *address = (int*) args;
 
     struct Route_Table *node = (struct Route_Table*) args;
 
-    //check metric
+
     log_handler("ID:%d, timeout, removing from route table\n", node->address);
-    //scan routetable
-    //struct Route_Table *item, *prior;
+ 
 
-    pthread_mutex_lock(&write_route_table);        //lock
-
+    pthread_mutex_lock(&access_route_table);        //lock
     node->metric = MAX_HOP + 1;
     triggered_update(node);
+    pthread_mutex_unlock(&access_route_table);     //unlock
+
+    pthread_mutex_lock(&node->garbage.change_time); 
     node->garbage.valid = true;
+    pthread_mutex_unlock(&node->garbage.change_time); 
 
-    pthread_mutex_unlock(&write_route_table);     //unlock
 
-
-    
+  
     set_time(&node->garbage, &node->garbage.timer_thread);
+
     log_handler("Setting timer %d for garbage collection %d\n", node->garbage.timer, node->address);
     
     if (pthread_join(node->garbage.timer_thread, NULL) != 0) 
@@ -390,9 +379,16 @@ void route_table_timeout(void* args)
 
     if (!node->garbage.valid)
     {
-        log_handler("Need to cancel garbage process\n");
+        log_handler("Canceling garbage process\n");
+        pthread_mutex_lock(&node->timeout.change_time);  
         node->timeout.timer.tv_sec = TIMEOUT;
+        pthread_mutex_unlock(&node->timeout.change_time);
+
+        pthread_mutex_lock(&node->garbage.change_time);
         node->garbage.timer.tv_sec = GARBAGE;
+        pthread_mutex_unlock(&node->garbage.change_time);
+
+        log_handler("Timeout and Garbage Reset\n");
         set_time(&node->timeout, &node->timeout.timer_thread);   //re-init the timer thread for timeout
     }
 
@@ -401,23 +397,22 @@ void route_table_timeout(void* args)
 
 void add_route_table(struct RIP_Entry *re, int nexthop, int iface, int cost)
 {
-    //check metric
 
-    //scan routetable
     struct Route_Table *item, *prior;
 
-    pthread_mutex_lock(&write_route_table);   //lock
 
     item = routetable;
     prior = item;
     bool found = false;
     
+
+    pthread_mutex_lock(&access_route_table);   //lock
+
     do
     {
         if(item->address == re->destination)
         {
-            found = true;   
-            //log_handler("found route %d at %d\n", item->address, item);             
+            found = true;                
             break;
 
         }
@@ -428,19 +423,23 @@ void add_route_table(struct RIP_Entry *re, int nexthop, int iface, int cost)
     
     if(found)
     {
-
+        
 
         if(item->metric == re->metric + cost) 
         {
 
-           
+            pthread_mutex_lock(&item->timeout.change_time); 
             item->timeout.timer.tv_sec = TIMEOUT;   //renew the timeout 
+            pthread_mutex_unlock(&item->timeout.change_time); 
+
             item->flag = false;
 
             if (item->garbage.valid)
             {
                 log_handler("Receiving valid updates, cancel garbaging\n");
+                pthread_mutex_lock(&item->garbage.change_time); 
                 item->garbage.valid = false;
+                pthread_mutex_unlock(&item->garbage.change_time); 
             }
             else  log_handler("ID:%d metric is the same, do nothing\n", re->destination);
             
@@ -454,7 +453,11 @@ void add_route_table(struct RIP_Entry *re, int nexthop, int iface, int cost)
                 {                    
                     item->metric = MAX_HOP + 1;
                     triggered_update(item);
+
+                    pthread_mutex_lock(&item->timeout.change_time); 
                     item->timeout.timer.tv_sec = 0;
+                    pthread_mutex_unlock(&item->timeout.change_time); 
+
                     item->flag = true;
                 }
                 else 
@@ -462,7 +465,9 @@ void add_route_table(struct RIP_Entry *re, int nexthop, int iface, int cost)
                     if (item->garbage.valid)
                     {
                         log_handler("Receiving valid updates, cancel garbaging\n");
+                        pthread_mutex_lock(&item->garbage.change_time); 
                         item->garbage.valid = false;
+                        pthread_mutex_unlock(&item->garbage.change_time); 
                     }
 
                     item->metric = re->metric + cost;
@@ -470,7 +475,9 @@ void add_route_table(struct RIP_Entry *re, int nexthop, int iface, int cost)
                     item->iface = iface;
                     item->flag = true;
 
-                    item->timeout.timer.tv_sec = TIMEOUT;   //renew the timeout 
+                    pthread_mutex_lock(&item->timeout.change_time); 
+                    item->timeout.timer.tv_sec = TIMEOUT;   //renew the timeout
+                    pthread_mutex_unlock(&item->timeout.change_time);  
                 }
             }
 
@@ -496,11 +503,14 @@ void add_route_table(struct RIP_Entry *re, int nexthop, int iface, int cost)
         node->timeout.fun_ptr = &route_table_timeout;
         node->timeout.args = node; 
         node->timeout.valid = true;
+        pthread_mutex_init(&node->timeout.change_time, NULL);
 
         node->garbage.timer.tv_sec = GARBAGE;
         node->garbage.fun_ptr = &garbage_collect;
-        node->garbage.args = &node->address; 
+        node->garbage.args = node; 
         node->garbage.valid = false;
+        pthread_mutex_init(&node->garbage.change_time, NULL);
+
 
         set_time(&node->timeout, &node->timeout.timer_thread);
         log_handler("Adding %d to timeout timer, route pointer is %d:\n", node->address, node);
@@ -523,7 +533,7 @@ void add_route_table(struct RIP_Entry *re, int nexthop, int iface, int cost)
     }    
 
 
-    pthread_mutex_unlock(&write_route_table);       //unlock
+    pthread_mutex_unlock(&access_route_table);       //unlock
    
 
 }
@@ -597,19 +607,80 @@ void init()
     routetable->iface = 0;
     routetable->flag = false;
 
-    pthread_mutex_t write_route_table = PTHREAD_MUTEX_INITIALIZER;
+    pthread_mutex_t access_route_table = PTHREAD_MUTEX_INITIALIZER;
     pthread_mutex_t screen = PTHREAD_MUTEX_INITIALIZER;
 }
 
 
 bool check_port(int port)
 {
-    return (port >= 1024 && port <= 64000);
+    bool output = true;
+    if (port < 1024 || port > 64000)
+    {
+        output = false;
+    }
+    else
+    {
+        for (int i=0; i<self.input_number; i++)
+        {
+            if (port == self.input[i].port)
+            {
+                output = false;
+                log_handler("Port %d is already occured in input field\n", port);
+                break;
+            }
+        }
+
+        if (output)
+        {
+            for (int i=0; i<self.output_number; i++)
+            {
+                if (port == self.output[i].port)
+                {
+                    output = false;
+                    log_handler("Port %d is already occured in output field\n", port);
+                    break;
+                }
+            }
+        }
+    }
+    
+    return output;
 }
 
 bool check_routerid(int routerid)
 {
-    return (routerid > 0 && routerid <= 64000);
+    bool output = true;
+    if (routerid <= 0 || routerid > 64000)
+    {
+        output = false;
+    }
+    else
+    {
+
+        if (routerid == self.routerid)
+        {
+            output = false;
+            log_handler("ID %d is confict to local router-id\n", routerid);
+            
+        }
+        
+
+        if (output)
+        {
+            for (int i=0; i<self.output_number; i++)
+            {
+                if (routerid == self.output[i].routerid)
+                {
+                    output = false;
+                    log_handler("ID %d is already occured in output field\n", routerid);
+                    break;
+                }
+            }
+        }
+    }
+
+    return output;
 }
 
 bool check_metric(int metric)
@@ -722,6 +793,11 @@ int readConfig(char *cfg_file, struct ConfigItem *item)
                         
                         memset(temp, '\0', sizeof(temp));            //read peer port
                         dash = strchr(ptr, '-');
+                        if (dash == NULL)
+                        {
+                            log_handler("ERROR: format error at line %d\n", n);
+                            exit_program();
+                        }
                         strncpy(temp, ptr, dash - ptr);
                         if (!check_port(atoi(temp)))
                         {
@@ -734,6 +810,11 @@ int readConfig(char *cfg_file, struct ConfigItem *item)
                         memset(temp, '\0', sizeof(temp));            //read peer metric
                         ptr = dash + 1;                             
                         dash = strchr(ptr, '-');
+                        if (dash == NULL)
+                        {
+                            log_handler("ERROR: format error at line %d\n", n);
+                            exit_program();
+                        }
                         strncpy(temp, ptr, dash - ptr);
                         if (!check_metric(atoi(temp)))
                         {
@@ -772,6 +853,23 @@ int readConfig(char *cfg_file, struct ConfigItem *item)
 
     free(line);
     fclose(fp);
+
+    if (self.routerid == -1) 
+    {
+        log_handler("ERROR: Can't find router-id\n");
+        exit_program();
+    }
+    if (self.input_number == 0) 
+    {
+        log_handler("ERROR: Can't find input field\n");
+        exit_program();
+    }
+    if (self.output_number == 0) 
+    {
+        log_handler("ERROR: Can't find output field\n");
+        exit_program();
+    }
+
 }
 
 
@@ -887,20 +985,23 @@ void print_bytes(unsigned char *bytes, size_t num_bytes) {
 
 void print_route_table()
 {
-    pthread_mutex_lock(&screen);
-    printf("\n============  Route Table  ==============\n");
-    printf("%-10s%-10s%-10s%-10s%-10s%-10s%-10s%-10s\n","Dest", "Metric", "NextHop", "ChgFlag", "Iface", "Timeout", "Garbage", "Pointer");
+    
+    printf("\n===================  Route Table  =====================\n");
+    printf("%-6s%-8s%-9s%-9s%-7s%-9s%-10s\n","Dest", "Metric", "NextHop", "ChgFlag", "Iface", "Timeout", "Garbage");
+    printf("-------------------------------------------------------\n");
     struct Route_Table *item = routetable->next;
+    pthread_mutex_lock(&access_route_table); 
     while(item != NULL)
     {
         char flag = 'N';
         if (item->flag) flag = 'Y';
-        printf("%-10d%-10d%-10d%-10c%-10d%-10ld%-10ld%-10d\n",item->address, item->metric, item->next_hop, flag, item->iface, item->timeout.timer.tv_sec, item->garbage.timer.tv_sec, item);
-
+        
+        printf("%-6d%-8d%-9d%-9c%-7d%-9ld%-10ld\n",item->address, item->metric, item->next_hop, flag, item->iface, item->timeout.timer.tv_sec, item->garbage.timer.tv_sec);
+        
         item = item->next;
     }
-    printf("============  Route Table END  ============\n");
-    pthread_mutex_unlock(&screen);
+    pthread_mutex_unlock(&access_route_table); 
+    printf("=================  Route Table END  ===================\n");
 }
 
 void* listen_process(void *argv)
@@ -922,7 +1023,9 @@ void* update_process()
     {
         for (int i = 0; i < self.input_number; i++)
         {
+            pthread_mutex_lock(&access_route_table); 
             send_update(&self.input[i], NULL);
+            pthread_mutex_unlock(&access_route_table); 
         }
 
         print_route_table();
@@ -936,30 +1039,32 @@ void* update_process()
 }
 
 
-void* CLI_daemon()
+void* CLI_daemon()    //very silly approach for cisco-like CLI(command line interface)
 {
-    printf("Router_%d>",self.routerid);
+    printf("Router_%d>",self.routerid);  //prompt with hostname
     while(!gracequit)
     {
         char cli_command[128];
-        fgets(cli_command, 128, stdin);
+        fgets(cli_command, 128, stdin);     //read command
         pthread_mutex_lock(&screen);
-        if (strcmp(cli_command, "terminal monitor\n") == 0) 
+
+
+        if (strcmp(cli_command, "terminal monitor\n") == 0)    //ter mo
         {
             showlog = true;
             printf("Logging displays Enable\n");
         }
-        else if (strcmp(cli_command, "terminal no monitor\n") == 0) 
+        else if (strcmp(cli_command, "terminal no monitor\n") == 0)   //ter no mo
         {
             showlog = false;
             printf("Logging displays Disable\n");
         }
-        else if (strcmp(cli_command, "exit\n") == 0) 
+        else if (strcmp(cli_command, "exit\n") == 0)   //exit
         {
             gracequit = true;
             printf("Shutting Down\n");
         }
-        else if (strcmp(cli_command, "show config\n") == 0) 
+        else if (strcmp(cli_command, "show run\n") == 0)    //show run
         {
             printf("Router id: %d\n", self.routerid);
             printf("Input UDP Number: ");
@@ -969,11 +1074,25 @@ void* CLI_daemon()
             }
             printf("\n");
             printf("Neighbors:\n");
+            for(int i=0; i<self.output_number; i++)
+            {
+                printf("    Router-id: %d, port: %d, metric: %d\n", self.output[i].routerid, self.output[i].port, self.output[i].metric);
+            }
 
         }
+        else if (strcmp(cli_command, "help\n") == 0 || strcmp(cli_command, "?\n") == 0)       //help
+        {
+            printf("%-30s%s\n", "terminal monitor", "Shows debug logging on screen");
+            printf("%-30s%s\n", "terminal no monitor", "Hide debug logging on screen");
+            printf("%-30s%s\n", "show run", "Shows RIP running config");
+            printf("%-30s%s\n", "exit", "Release all resources and quit the program");
+            
+
+        }
+
         else if (strcmp(cli_command, "\n") != 0)
         {
-            printf("Unknown command %s, use help\n", cli_command);
+            printf("Unknown command %sUse help command\n", cli_command);
         }
 
 
@@ -1001,8 +1120,10 @@ int main(int argc, char **argv)
         exit(1);
     }
 
+    showlog = true;
     readConfig(argv[1], &self);
-    
+    showlog = false;
+
     routetable->address = self.routerid;
 
 
@@ -1024,13 +1145,8 @@ int main(int argc, char **argv)
     }
 
 
-    log_handler("Sending: \n===============================\n");
-    for(int i=0; i<self.output_number; i++)
-    {
-         log_handler("OUTPUT: port: %d, metric: %d, peer: %d\n",  self.output[i].port, self.output[i].metric, self.output[i].routerid);
-    }
-    log_handler("================================\n");
 
+    
     
     if (pthread_create(&updater,NULL,update_process, NULL) != 0)
         {
