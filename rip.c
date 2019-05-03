@@ -1,7 +1,12 @@
 /*
 Use gcc rip.c -o rip -lpthread to compile
 
-Author: Ran Bi
+Author: BR
+
+Reference: RFC 2453 RIP Version 2
+
+This code is the assignment of COSC364 in University of Canterbury
+
 
 */
 
@@ -34,6 +39,7 @@ typedef char byte;
 char *configName[] =  {"router-id", "input-ports", "outputs"};
 
 bool showlog = false;
+bool gracequit = false;
 
 //============== Global Variables ============================
 
@@ -50,6 +56,7 @@ struct Interface
     int sockfd;
     struct Peer *neighbor;
     bool found_peer;
+    pthread_mutex_t send_socket;   //socket send is not an atomic operation
 };
 
 struct ConfigItem
@@ -81,24 +88,21 @@ struct Route_Table
     struct Timer_Struct timeout;
     struct Timer_Struct garbage;
     int iface;                  //the interface to next hop
-                         
-    
-    //struct Timer_Struct timerdata;
+                     
 }*routetable;
 
-pthread_mutex_t write_route_table;
+pthread_mutex_t write_route_table;  //protect route_table so only one thread can access at a time
 
 
 
-
-struct ripHeader {
-  byte command; 		// 1-REQUEST, 2-RESPONSE 
-  byte version;
+struct RIP_Header {
+  byte command; 		    // 1-REQUEST, 2-RESPONSE 
+  byte version;             // 2 in this assignment
   short int routerid;       // it should be zero, but we used as router-id
 };
 
 
-struct ripEntry {
+struct RIP_Entry {
   short int addrfamily;
   short int zero;
   uint32_t destination;    // neighbor port
@@ -171,14 +175,9 @@ void* time_handler(void *args)
     
 }
 
-//void set_time(struct timeval *timer, void (*fun_ptr)(), void *args)
+
 void set_time(struct Timer_Struct *timerdata, pthread_t *timer_thread)
 {
-    //pthread_t timer_thread;          //create timer thread id
-    /*struct Timer_Struct timerdata;    //initial passing args
-    timerdata.timer = *timer;
-    timerdata.fun_ptr = fun_ptr;
-    timerdata.args = args;*/
 
 
     log_handler("Set Timer %d\n", timerdata->timer.tv_sec); 
@@ -188,16 +187,12 @@ void set_time(struct Timer_Struct *timerdata, pthread_t *timer_thread)
             exit(1);
     }
 
-    /*if (pthread_join(timer_thread, NULL) != 0) {       //waiting for timer thread quit
-            perror("pthread_join");
-            exit(1);
-        }*/
     log_handler("Timer quit success\n");
 
 }
 
 
-void packet_header(struct packet *msg, struct ripHeader rh)
+void packet_header(struct packet *msg, struct RIP_Header rh)
 {   
 
     msg->size += sizeof(rh);
@@ -206,7 +201,7 @@ void packet_header(struct packet *msg, struct ripHeader rh)
     memcpy(msg->message, (void*)&rh, sizeof(rh));
 }
 
-void packet_entry(struct packet *msg, struct ripEntry re)
+void packet_entry(struct packet *msg, struct RIP_Entry re)
 {   
 
     
@@ -220,8 +215,8 @@ void packet_entry(struct packet *msg, struct ripEntry re)
 
 void generate_update(struct packet *msg, int nexthop, struct Route_Table *node) 
 { 
-    struct ripHeader rh;
-    struct ripEntry re;
+    struct RIP_Header rh;
+    struct RIP_Entry re;
     rh.command = COMMAND;
     rh.version = VERSION;
     rh.routerid = self.routerid;
@@ -277,7 +272,9 @@ void send_update(struct Interface *interface, struct Route_Table *node)
     {
         remote.sin_port = htons(interface->neighbor->port);    /* this is port number  */
         generate_update(&msg, interface->neighbor->routerid, node) ;
+        pthread_mutex_lock(&interface->send_socket);
         rc = sendto(interface->sockfd, msg.message, msg.size, 0, (struct sockaddr *)&remote, sizeof(remote));
+        pthread_mutex_unlock(&interface->send_socket);
         //int rc = sendto(interface->sockfd, "update", 6, 0, (struct sockaddr *)&remote, sizeof(remote));
         if (rc == -1) {
             perror("sendto error");
@@ -290,7 +287,9 @@ void send_update(struct Interface *interface, struct Route_Table *node)
         for(int i = 0; i < self.output_number; i++)
         {
             remote.sin_port = htons(self.output[i].port);    /* this is port number  */
+            pthread_mutex_lock(&interface->send_socket);
             rc = sendto(interface->sockfd, msg.message, msg.size, 0, (struct sockaddr *)&remote, sizeof(remote));
+            pthread_mutex_unlock(&interface->send_socket);
             //int rc = sendto(interface->sockfd, "update", 6, 0, (struct sockaddr *)&remote, sizeof(remote));
             if (rc == -1) {
                 perror("sendto error");
@@ -393,7 +392,7 @@ void route_table_timeout(void* args)
     
 }
 
-void add_route_table(struct ripEntry *re, int nexthop, int iface, int cost)
+void add_route_table(struct RIP_Entry *re, int nexthop, int iface, int cost)
 {
     //check metric
 
@@ -525,20 +524,20 @@ void add_route_table(struct ripEntry *re, int nexthop, int iface, int cost)
 
 
 
-bool rip_head_validation(struct ripHeader *rh, int remoteid)
+bool rip_head_validation(struct RIP_Header *rh, int remoteid)
 {
     //log_handler("rip head: %d, %d, %d\n", rh->command == COMMAND , rh->version == VERSION , rh->zero == 0);
     return (rh->command == COMMAND && rh->version == VERSION && rh->routerid > 0 && rh->routerid <= 64000 && rh->routerid == remoteid);
 }
-bool rip_entry_validation(struct ripEntry *re)
+bool rip_entry_validation(struct RIP_Entry *re)
 {
     return (re->addrfamily == ADDRFAMILY && re->zero == 0 && re->zero1 == 0 && re->zero2 == 0 && re->metric <= MAX_HOP + 1);
 }
 
 void decode_packet(char* packet, int size, struct Interface* interface)
 {
-    struct ripHeader rh;
-    struct ripEntry re;
+    struct RIP_Header rh;
+    struct RIP_Entry re;
     int i = 4;
     if ((size - 4) % 20 || size < 4)
     {
@@ -571,15 +570,6 @@ void decode_packet(char* packet, int size, struct Interface* interface)
         }
     }   
 }
-
-
-
-
-
-
-
-
-
 
 
 
@@ -703,6 +693,7 @@ int readConfig(char *cfg_file, struct ConfigItem *item)
                             item->input[item->input_number - 1].neighbor = NULL;
                             item->input[item->input_number - 1].found_peer = false;
                             item->input[item->input_number - 1].sockfd = 0;
+                            pthread_mutex_init(&item->input[item->input_number - 1].send_socket, NULL);
                             content = NULL;
 
                             log_handler("INPUT:%d\n", item->input[item->input_number - 1].port);
@@ -896,7 +887,7 @@ void print_route_table()
     {
         char flag = 'N';
         if (item->flag) flag = 'Y';
-        printf("%-10d%-10d%-10d%-10c%-10d%-10d%-10d%-10d\n",item->address, item->metric, item->next_hop, flag, item->iface, item->timeout.timer.tv_sec, item->garbage.timer.tv_sec, item);
+        printf("%-10d%-10d%-10d%-10c%-10d%-10ld%-10ld%-10d\n",item->address, item->metric, item->next_hop, flag, item->iface, item->timeout.timer.tv_sec, item->garbage.timer.tv_sec, item);
 
         item = item->next;
     }
@@ -924,6 +915,7 @@ void* update_process()
         {
             send_update(&self.input[i], NULL);
         }
+
         print_route_table();
         srand(time(NULL) + self.routerid);
         int r = rand() % (UPDATE * 1000000 / 6);
@@ -935,7 +927,13 @@ void* update_process()
 }
 
 
+void CLI_daemon()
+{
+    while(1)
+    {
 
+    }
+}
 
 
 
