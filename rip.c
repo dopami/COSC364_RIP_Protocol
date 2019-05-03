@@ -24,6 +24,7 @@ This code is the assignment of COSC364 in University of Canterbury
 #include <stdarg.h>
 #include <fcntl.h>
 
+//============  Fixed values and announcements ===============================
 #define BUF_SIZE 1500
 #define MAX_HOP 15
 #define UPDATE 5
@@ -34,35 +35,28 @@ This code is the assignment of COSC364 in University of Canterbury
 #define ADDRFAMILY 2
 
 typedef char byte;
+char *configName[] =  {"router-id", "input-ports", "outputs"}; //dict for reading config file
 
+//============== Structures ==================================================
 
-char *configName[] =  {"router-id", "input-ports", "outputs"};
-
-bool showlog = false;
-bool gracequit = false;
-pthread_mutex_t screen;   //display will not be interrupted
-pthread_mutex_t access_route_table;  //protect route_table so only one thread can access at a time
-
-
-//============== Global Variables ============================
-
-struct Peer
+struct Peer                        //neighbor structure
 {
     int port;
     int metric;
     int routerid;
 };
 
-struct Interface
+struct Interface                  //iface structure stores all port information used in this session
 {
     int port;
-    int sockfd;
+    int sockfd;                  //socket int
     struct Peer *neighbor;
     bool found_peer;
+    pthread_t listener;             //create PIDs for listener
     pthread_mutex_t send_socket;   //socket send is not an atomic operation
 };
 
-struct ConfigItem
+struct ConfigItem                   //read config and save here
 {
     int routerid;
     int input_number;
@@ -72,7 +66,7 @@ struct ConfigItem
     struct Peer *output;
 }self;
 
-struct Timer_Struct
+struct Timer_Struct                 //timer argument, which is easy to protect and pass args to threads
 {
     struct timeval timer;
     void (*fun_ptr)();
@@ -82,7 +76,7 @@ struct Timer_Struct
     pthread_mutex_t change_time;
 };
 
-struct Route_Table
+struct Route_Table                  //the route table structure, use linked-list, if large enough, use hash table
 {   
     struct Route_Table *next;    //linked-list with structure node
     int address;                 //dest address
@@ -93,19 +87,17 @@ struct Route_Table
     struct Timer_Struct garbage;
     int iface;                  //the interface to next hop
                      
-}*routetable;
+}*routetable;                   //as a group for dynamic allocate
 
 
-
-
-struct RIP_Header {
+struct RIP_Header {         //header structure for RIP message
   byte command; 		    // 1-REQUEST, 2-RESPONSE 
   byte version;             // 2 in this assignment
   short int routerid;       // it should be zero, but we used as router-id
 };
 
 
-struct RIP_Entry {
+struct RIP_Entry {         //entry message for RIP message
   short int addrfamily;
   short int zero;
   uint32_t destination;    // neighbor port
@@ -114,20 +106,65 @@ struct RIP_Entry {
   uint32_t metric;
 };
 
-struct packet
+struct packet               //the packet structure, stores the message and size
 {
     char *message;
     int size;
 };
 
+//============  Global variables =============================================
+
+bool showlog = false;
+bool gracequit = false;   //used to tell everyone it is time to kill self
+pthread_mutex_t screen;   //display will not be interrupted
+pthread_mutex_t access_route_table;  //protect route_table so only one thread can access at a time
 
 
-//=============================================================
+pthread_t updater;
+pthread_t cli;
+
+
+//==================== helper function ==========================
+
 
 void exit_program()                        //release all resources, wait for thread end, free memory
 {
+
+    //wait for threads end
+
+    struct Route_Table *node = routetable;
+
+    while(node->next != NULL)
+    {
+        if (pthread_join(node->timeout.timer_thread, NULL) != 0) {
+            perror("pthread_join");
+            exit(1);
+        }
+        if (pthread_join(node->garbage.timer_thread, NULL) != 0) {
+            perror("pthread_join");
+            exit(1);
+        }
+        node = node->next;
+    }
+    
+    for(int i=0; i<self.input_number; i++)
+    {
+        if (pthread_join(self.input[i].listener, NULL) != 0) {
+            perror("pthread_join");
+            exit(1);
+        }
+    }
+
+    if (pthread_join(cli, NULL) != 0) {
+            perror("pthread_join");
+            exit(1);
+    }
+
+    free(routetable);
     free(self.input);
     free(self.output);
+
+
 
     exit(0);
 }
@@ -160,16 +197,16 @@ void* time_handler(void *args)
     log_handler("Starting Timer, %d\n", timerdata->timer.tv_sec); 
 
     
-    while (timerdata->timer.tv_sec > 0 && timerdata->valid)  //if we don't need to cancel the timer, or time still left
+    while (timerdata->timer.tv_sec > 0 && timerdata->valid && !gracequit)  //if we don't need to cancel the timer, or time still left
     {
-        log_handler("time left %d\n", timerdata->timer.tv_sec);
+        
         pthread_mutex_lock(&timerdata->change_time);    
         timerdata->timer.tv_sec --;   //adjust timer
         pthread_mutex_unlock(&timerdata->change_time); 
         sleep(1);         //wait 1 second 
     }
 
-    if (timerdata->valid)  (timerdata->fun_ptr)(timerdata->args);       //if we don't need to cancel the timer, call the function
+    if (timerdata->valid && !gracequit)  (timerdata->fun_ptr)(timerdata->args);       //if we don't need to cancel the timer, call the function
     
     pthread_exit(0);                      //exit thread
 
@@ -193,6 +230,9 @@ void set_time(struct Timer_Struct *timerdata, pthread_t *timer_thread)
 }
 
 
+//================ RIP message construct ==============================
+//convert structure into message using "bitly" memcopy
+
 void packet_header(struct packet *msg, struct RIP_Header rh)
 {   
 
@@ -212,8 +252,9 @@ void packet_entry(struct packet *msg, struct RIP_Entry re)
     msg->size += sizeof(re);
 }
 
-
-
+//=============== The function used to generate and send RIP updates ===================
+//if node is NULL, it means regular update. Send all entries from route table
+//if node is not NULL, indicates that is a triggered update, only send the node
 void generate_update(struct packet *msg, int nexthop, struct Route_Table *node) 
 { 
     struct RIP_Header rh;
@@ -269,7 +310,7 @@ void send_update(struct Interface *interface, struct Route_Table *node)
     struct packet msg;
     msg.size = 0;
 
-    if (interface->found_peer) 
+    if (interface->found_peer)     //if we know which port to the peer
     {
         remote.sin_port = htons(interface->neighbor->port);    /* this is port number  */
         generate_update(&msg, interface->neighbor->routerid, node) ;
@@ -281,10 +322,9 @@ void send_update(struct Interface *interface, struct Route_Table *node)
             perror("sendto error");
         }
     }
-    else 
+    else        //if we don't know which port to this peer, we send all informations
     {
-
-        generate_update(&msg, -1, node) ;
+        generate_update(&msg, -1, node) ;  //router id set to -1 means we can't match any peer, no split horizon
         for(int i = 0; i < self.output_number; i++)
         {
             remote.sin_port = htons(self.output[i].port);    /* this is port number  */
@@ -297,35 +337,30 @@ void send_update(struct Interface *interface, struct Route_Table *node)
             }
         }
         log_handler("Sending all route entries from port %d\n", interface->port);
-
     }
-    
-
-
 }
 
 
 void triggered_update(struct Route_Table *node)
 {
 
+    log_handler("Triggered Update for dest %d with metric %d\n",node->address, node->metric);
     for (int i = 0; i < self.input_number; i++)
         {
             send_update(&self.input[i], node);
         }
 }
 
+//==================  The function to operates route table ===========
 
-
-void garbage_collect(void* args)
+void remove_route_table(struct Route_Table *node)  //remove
 {
-    struct Route_Table *node = (struct Route_Table*) args;
 
     //check metric
     log_handler("ID:%d, Deleting route table entry\n", node->address);
     //scan routetable
     struct Route_Table *item, *prior;
 
-    pthread_mutex_lock(&access_route_table);   //lock
     item = routetable;
     prior = item;    
     do
@@ -340,52 +375,60 @@ void garbage_collect(void* args)
         prior = item;
         item = item->next;
     }while (item != NULL);
-    pthread_mutex_unlock(&access_route_table);   //unlock
 
     log_handler("Route table entry deleted\n");
 }
 
 
-void route_table_timeout(void* args)
+void garbage_collect(void* args)       //garbage timer handler will call this
+{
+    struct Route_Table *node = (struct Route_Table*) args;
+
+
+    pthread_mutex_lock(&access_route_table);   //lock
+    remove_route_table(node);
+    pthread_mutex_unlock(&access_route_table);   //unlock
+
+    log_handler("Garbage Collected\n");
+}
+
+
+void route_table_timeout(void* args)  //timeout timer handler will call this
 {
 
 
     struct Route_Table *node = (struct Route_Table*) args;
 
-
     log_handler("ID:%d, timeout, removing from route table\n", node->address);
  
-
     pthread_mutex_lock(&access_route_table);        //lock
     node->metric = MAX_HOP + 1;
-    triggered_update(node);
+    triggered_update(node);         //the route becomes invalid, tell others
     pthread_mutex_unlock(&access_route_table);     //unlock
 
-    pthread_mutex_lock(&node->garbage.change_time); 
-    node->garbage.valid = true;
-    pthread_mutex_unlock(&node->garbage.change_time); 
-
-
+    pthread_mutex_lock(&node->garbage.change_time);  //lock
+    node->garbage.valid = true;  //the garbage timer is ok to go
+    pthread_mutex_unlock(&node->garbage.change_time);  //unlock
   
     set_time(&node->garbage, &node->garbage.timer_thread);
 
     log_handler("Setting timer %d for garbage collection %d\n", node->garbage.timer, node->address);
     
-    if (pthread_join(node->garbage.timer_thread, NULL) != 0) 
+    if (pthread_join(node->garbage.timer_thread, NULL) != 0)  //wait garbage handler finish
             {
                 perror("pthread_join");
                 exit(1);
             }
 
-    if (!node->garbage.valid)
+    if (!node->garbage.valid)      //if garbage is cancelled due to peer back
     {
         log_handler("Canceling garbage process\n");
-        pthread_mutex_lock(&node->timeout.change_time);  
-        node->timeout.timer.tv_sec = TIMEOUT;
+        pthread_mutex_lock(&node->timeout.change_time);   
+        node->timeout.timer.tv_sec = TIMEOUT;           //reset timer
         pthread_mutex_unlock(&node->timeout.change_time);
 
         pthread_mutex_lock(&node->garbage.change_time);
-        node->garbage.timer.tv_sec = GARBAGE;
+        node->garbage.timer.tv_sec = GARBAGE;           //reset timer
         pthread_mutex_unlock(&node->garbage.change_time);
 
         log_handler("Timeout and Garbage Reset\n");
@@ -395,20 +438,20 @@ void route_table_timeout(void* args)
     
 }
 
-void add_route_table(struct RIP_Entry *re, int nexthop, int iface, int cost)
+
+void add_route_table(struct RIP_Entry *re, int nexthop, int iface, int cost)  
+//add RIP entry to route table
 {
 
     struct Route_Table *item, *prior;
 
-
     item = routetable;
     prior = item;
-    bool found = false;
-    
+    bool found = false;       //not found in route table means we can create a new one    
 
     pthread_mutex_lock(&access_route_table);   //lock
 
-    do
+    do                      //searching route table
     {
         if(item->address == re->destination)
         {
@@ -421,24 +464,23 @@ void add_route_table(struct RIP_Entry *re, int nexthop, int iface, int cost)
         
     }while (item != NULL);
     
-    if(found)
+    if(found)       //we found one with same destination
     {
         
-
-        if(item->metric == re->metric + cost) 
+        if(item->metric == re->metric + cost && item->metric != MAX_HOP + 1) 
+        //the metric is not optimal, and not the poison-reverse or triggered updates
         {
 
             pthread_mutex_lock(&item->timeout.change_time); 
             item->timeout.timer.tv_sec = TIMEOUT;   //renew the timeout 
             pthread_mutex_unlock(&item->timeout.change_time); 
-
             item->flag = false;
 
-            if (item->garbage.valid)
+            if (item->garbage.valid)    //if garbage collector is counting
             {
                 log_handler("Receiving valid updates, cancel garbaging\n");
                 pthread_mutex_lock(&item->garbage.change_time); 
-                item->garbage.valid = false;
+                item->garbage.valid = false;     //recover timeout time
                 pthread_mutex_unlock(&item->garbage.change_time); 
             }
             else  log_handler("ID:%d metric is the same, do nothing\n", re->destination);
@@ -448,21 +490,23 @@ void add_route_table(struct RIP_Entry *re, int nexthop, int iface, int cost)
         {
             if ((item->next_hop == nexthop) || (item->next_hop != nexthop && item->metric > re->metric + cost))
             {
+                //here comes the msg from current router, or optimal router
                 log_handler("Changing %d in routetable:\n", re->destination);
-                if (re->metric + cost >= MAX_HOP + 1)
+                if (re->metric + cost >= MAX_HOP + 1)    // received triggered update from current router, delete asap
                 {                    
                     item->metric = MAX_HOP + 1;
                     triggered_update(item);
 
                     pthread_mutex_lock(&item->timeout.change_time); 
-                    item->timeout.timer.tv_sec = 0;
+                    item->timeout.valid = false;
+                    remove_route_table(item);
                     pthread_mutex_unlock(&item->timeout.change_time); 
 
-                    item->flag = true;
+                    
                 }
                 else 
                 {
-                    if (item->garbage.valid)
+                    if (item->garbage.valid)  //peer alive, cancel garbage counting
                     {
                         log_handler("Receiving valid updates, cancel garbaging\n");
                         pthread_mutex_lock(&item->garbage.change_time); 
@@ -484,22 +528,20 @@ void add_route_table(struct RIP_Entry *re, int nexthop, int iface, int cost)
         }
     }
 
-    else if (re->metric + cost <= MAX_HOP)
+    else if (re->metric + cost <= MAX_HOP) //add a new item
     {   
         log_handler("Adding %d to routetable:\n", re->destination);
         struct Route_Table *node = (struct Route_Table*)malloc(sizeof(struct Route_Table));
+        //create a node and allocate memory
+        //initialize the node
         node->address = re->destination;        
         node->next_hop = nexthop;
         node->iface = iface;
         node->flag = true;
         
-        node->metric = re->metric + cost;   
-
+        node->metric = re->metric + cost;  
         node->timeout.timer.tv_sec = TIMEOUT; 
-        
- 
 
-        //node->timerdata.timer = &node->timeout;
         node->timeout.fun_ptr = &route_table_timeout;
         node->timeout.args = node; 
         node->timeout.valid = true;
@@ -514,10 +556,9 @@ void add_route_table(struct RIP_Entry *re, int nexthop, int iface, int cost)
 
         set_time(&node->timeout, &node->timeout.timer_thread);
         log_handler("Adding %d to timeout timer, route pointer is %d:\n", node->address, node);
-
         
         
-        item = routetable->next;
+        item = routetable->next;  
         prior = routetable;
 
         while (item != NULL)            //find the place to insert the router table node
@@ -528,7 +569,7 @@ void add_route_table(struct RIP_Entry *re, int nexthop, int iface, int cost)
             item = item->next;
         }
 
-        node->next = item;
+        node->next = item;              //link the node into route table
         prior->next = node;
     }    
 
@@ -539,11 +580,33 @@ void add_route_table(struct RIP_Entry *re, int nexthop, int iface, int cost)
 }
 
 
+void print_route_table()  //print route table
+{
+    
+    printf("\n===================  Route Table  =====================\n");
+    printf("%-6s%-8s%-9s%-9s%-7s%-9s%-10s\n","Dest", "Metric", "NextHop", "ChgFlag", "Iface", "Timeout", "Garbage");
+    printf("-------------------------------------------------------\n");
+    struct Route_Table *item = routetable->next;
+    pthread_mutex_lock(&access_route_table); 
+    while(item != NULL)
+    {
+        char flag = 'N';
+        if (item->flag) flag = 'Y';
+        
+        printf("%-6d%-8d%-9d%-9c%-7d%-9ld%-10ld\n",item->address, item->metric, item->next_hop, flag, item->iface, item->timeout.timer.tv_sec, item->garbage.timer.tv_sec);
+        
+        item = item->next;
+    }
+    pthread_mutex_unlock(&access_route_table); 
+    printf("=================  Route Table END  ===================\n");
+}
 
+
+//============  The msg decode and valiation function =============
 
 bool rip_head_validation(struct RIP_Header *rh, int remoteid)
 {
-    //log_handler("rip head: %d, %d, %d\n", rh->command == COMMAND , rh->version == VERSION , rh->zero == 0);
+    
     return (rh->command == COMMAND && rh->version == VERSION && rh->routerid > 0 && rh->routerid <= 64000 && rh->routerid == remoteid);
 }
 bool rip_entry_validation(struct RIP_Entry *re)
@@ -551,11 +614,14 @@ bool rip_entry_validation(struct RIP_Entry *re)
     return (re->addrfamily == ADDRFAMILY && re->zero == 0 && re->zero1 == 0 && re->zero2 == 0 && re->metric <= MAX_HOP + 1);
 }
 
+
 void decode_packet(char* packet, int size, struct Interface* interface)
+//read msg and convert into RH and RE
 {
     struct RIP_Header rh;
     struct RIP_Entry re;
     int i = 4;
+    bool drop = false;
     if ((size - 4) % 20 || size < 4)
     {
         log_handler("incoming package length error, drop\n");
@@ -566,53 +632,46 @@ void decode_packet(char* packet, int size, struct Interface* interface)
 
         if (!rip_head_validation(&rh, interface->neighbor->routerid))
         {
-            log_handler("head invalid, drop it\n");
+            log_handler("RIP Head invalid, drop it\n");
         }
         else
         {
             while (size - i > 0)
             {
                 memcpy(&re, (void*)packet + i, sizeof(re));
-                log_handler("GET ADDRESS: %d, metric: %d, next_hop: %d\n", re.destination, re.metric, rh.routerid);
+                
                 if (!rip_entry_validation(&re))
                 {
-                    log_handler("metric out of range, drop\n");
-                }
-                else 
-                {
-                    add_route_table(&re, rh.routerid, interface->port, interface->neighbor->metric);
+                    log_handler("RIP Entry invalid, drop\n");
+                    drop = true;
+                    break;
                 }
                 i += sizeof(re);
             }
+
+            if (!drop)
+            {
+                i = 4;
+                while (size - i > 0)
+                {
+                    memcpy(&re, (void*)packet + i, sizeof(re));
+                    log_handler("GET ADDRESS: %d, metric: %d, next_hop: %d\n", re.destination, re.metric, rh.routerid);
+                    add_route_table(&re, rh.routerid, interface->port, interface->neighbor->metric);
+                    
+                    i += sizeof(re);
+                }
+            }
+
         }
     }   
 }
 
 
 
-void init()
-{
-    self.routerid = -1;
-    self.input_number = 0;
-    self.output_number = 0;
-    self.routerid_status = false;
-    self.input = NULL;
-    self.output = NULL;
-
-    routetable = (struct Route_Table*)malloc(sizeof(struct Route_Table));
-    routetable->next = NULL;
-    routetable->address = self.routerid;
-    routetable->metric = 0;
-    routetable->next_hop = 0;
-    routetable->iface = 0;
-    routetable->flag = false;
-
-    pthread_mutex_t access_route_table = PTHREAD_MUTEX_INITIALIZER;
-    pthread_mutex_t screen = PTHREAD_MUTEX_INITIALIZER;
-}
-
+//============ validation tool ===================
 
 bool check_port(int port)
+//check if a port matchs our range and not duplicate
 {
     bool output = true;
     if (port < 1024 || port > 64000)
@@ -649,6 +708,7 @@ bool check_port(int port)
 }
 
 bool check_routerid(int routerid)
+//check if a routerid matchs our range and not duplicate
 {
     bool output = true;
     if (routerid <= 0 || routerid > 64000)
@@ -684,12 +744,14 @@ bool check_routerid(int routerid)
 }
 
 bool check_metric(int metric)
+//check if a metric matchs our range
 {
     return (metric >= 0 && metric <= 16);
 }
 
 
-
+//==============  Read Configuration File ===============
+//and stored into the config item structure
 int readConfig(char *cfg_file, struct ConfigItem *item)
 {
 
@@ -852,7 +914,7 @@ int readConfig(char *cfg_file, struct ConfigItem *item)
     }
 
     free(line);
-    fclose(fp);
+    fclose(fp);   //safe close
 
     if (self.routerid == -1) 
     {
@@ -872,8 +934,9 @@ int readConfig(char *cfg_file, struct ConfigItem *item)
 
 }
 
+//============ Listening related function ========================
 
-bool check_receive_match(int port)
+bool check_receive_match(int port)  //check if a received msg belongs to our peer
 {
     bool result = false;
     for (int i = 0; i < self.output_number; i++)
@@ -888,7 +951,7 @@ bool check_receive_match(int port)
 }
 
 
-void listen_port(struct Interface *interface)
+void listen_port(struct Interface *interface)  //listener threads will call this
 {
     struct timeval recv_timeout;   //set timeout value
     interface->sockfd = socket(AF_INET,SOCK_DGRAM,0);   //create UDP socket with default protocol    
@@ -896,9 +959,9 @@ void listen_port(struct Interface *interface)
     fd_set recvfd, sendfd;
 
     struct sockaddr_in local, remote; 
-    local.sin_family = AF_INET;          /* communicate using internet address */
-    local.sin_addr.s_addr = INADDR_ANY; /* accept all calls                   */
-    local.sin_port = htons(interface->port); /* this is port number                */
+    local.sin_family = AF_INET;          // communicate using internet address 
+    local.sin_addr.s_addr = INADDR_ANY; // accept all calls from local address    
+    local.sin_port = htons(interface->port); // this is port number               
 
     socklen_t remote_len;
 
@@ -906,16 +969,13 @@ void listen_port(struct Interface *interface)
 
     int i, rc, remote_port;
 
-    rc = bind(interface->sockfd,(struct sockaddr *)&local,sizeof(local)); /* bind address to socket   */ 
+    rc = bind(interface->sockfd,(struct sockaddr *)&local,sizeof(local)); // bind address to socket 
     if(rc == -1) { // Check for errors
         perror("bind");
         exit(1);
     }
 
     log_handler("Listening on port %d\n", interface->port);
-
-
-
 
     while(!gracequit) 
     {
@@ -928,6 +988,7 @@ void listen_port(struct Interface *interface)
         recv_timeout.tv_sec = TIMEOUT;
         recv_timeout.tv_usec = 0;
         switch(select(interface->sockfd + 1, &recvfd, NULL, NULL, &recv_timeout))
+        //use select to wait for interrupt
         {
             case -1:
                 log_handler("select error\n");
@@ -935,17 +996,17 @@ void listen_port(struct Interface *interface)
             case 0:
                 log_handler("TIMEOUT: Listening on port %d\n", interface->port);
                 break;
-            default:
+            default:  //if received something
                 if (FD_ISSET(interface->sockfd, &recvfd))
                 {
                     rc = recvfrom(interface->sockfd, buf, BUF_SIZE, 0, (struct sockaddr *)&remote, &remote_len);
+                    
                     if (rc == -1) {
                         log_handler("recvfrom error");
                     }      
                     remote_port = ntohs(remote.sin_port); 
                     if (check_receive_match(remote_port)) 
                     {
-                        //printf("Received %s at PORT %d\n",buf, remote_port);
                         struct Peer *peer; 
                         for(i = 0; i < self.output_number; i++)
                         {
@@ -958,7 +1019,7 @@ void listen_port(struct Interface *interface)
                         interface->neighbor = peer;
                         interface->found_peer = true;
 
-                        decode_packet(buf, rc, interface);
+                        decode_packet(buf, rc, interface);  //send to decoder
                         
                     }
                 }
@@ -969,12 +1030,13 @@ void listen_port(struct Interface *interface)
     }
 
 
-    close(interface->sockfd);
+    close(interface->sockfd);  //safely close socket before kill self
 
 }
 
 
-void print_bytes(unsigned char *bytes, size_t num_bytes) {
+void print_bytes(unsigned char *bytes, size_t num_bytes) //just a debugger, to print the bits of msg 
+{
     
   for (size_t i = 0; i < num_bytes; i++) {
     printf("%*u ", 3, bytes[i]);
@@ -983,41 +1045,19 @@ void print_bytes(unsigned char *bytes, size_t num_bytes) {
 }
 
 
-void print_route_table()
+//======= the function pointer to called by threads ============
+
+void* listen_process(void *argv)  //listener
 {
     
-    printf("\n===================  Route Table  =====================\n");
-    printf("%-6s%-8s%-9s%-9s%-7s%-9s%-10s\n","Dest", "Metric", "NextHop", "ChgFlag", "Iface", "Timeout", "Garbage");
-    printf("-------------------------------------------------------\n");
-    struct Route_Table *item = routetable->next;
-    pthread_mutex_lock(&access_route_table); 
-    while(item != NULL)
-    {
-        char flag = 'N';
-        if (item->flag) flag = 'Y';
-        
-        printf("%-6d%-8d%-9d%-9c%-7d%-9ld%-10ld\n",item->address, item->metric, item->next_hop, flag, item->iface, item->timeout.timer.tv_sec, item->garbage.timer.tv_sec);
-        
-        item = item->next;
-    }
-    pthread_mutex_unlock(&access_route_table); 
-    printf("=================  Route Table END  ===================\n");
-}
+    struct Interface *interface = (struct Interface *)argv;    
 
-void* listen_process(void *argv)
-{
-    
-    struct Interface *interface = (struct Interface *)argv;
-    
-    
-
-    listen_port(interface);
-       
+    listen_port(interface);       
 
     pthread_exit(0);
 }
 
-void* update_process()
+void* update_process()   //periodic updater
 {
     while(1)
     {
@@ -1028,7 +1068,7 @@ void* update_process()
             pthread_mutex_unlock(&access_route_table); 
         }
 
-        print_route_table();
+        print_route_table();      //print route_table here, lasy
         srand(time(NULL) + self.routerid);
         int r = rand() % (UPDATE * 1000000 / 6);
         log_handler("random sleep %d\n", r);
@@ -1101,6 +1141,27 @@ void* CLI_daemon()    //very silly approach for cisco-like CLI(command line inte
     }
 }
 
+//============== main related function ====================
+void init()   //program initialization
+{
+    self.routerid = -1;
+    self.input_number = 0;
+    self.output_number = 0;
+    self.routerid_status = false;
+    self.input = NULL;
+    self.output = NULL;
+
+    routetable = (struct Route_Table*)malloc(sizeof(struct Route_Table));
+    routetable->next = NULL;
+    routetable->address = self.routerid;
+    routetable->metric = 0;
+    routetable->next_hop = 0;
+    routetable->iface = 0;
+    routetable->flag = false;
+
+    pthread_mutex_t access_route_table = PTHREAD_MUTEX_INITIALIZER;
+    pthread_mutex_t screen = PTHREAD_MUTEX_INITIALIZER;
+}
 
 
 
@@ -1108,9 +1169,7 @@ void* CLI_daemon()    //very silly approach for cisco-like CLI(command line inte
 int main(int argc, char **argv) 
 {
 
-    pthread_t listener[self.input_number];   //create PIDs
-    pthread_t updater;
-    pthread_t cli;
+
 
     init();
 
@@ -1135,44 +1194,23 @@ int main(int argc, char **argv)
 
 
     
-    for(int i=0; i<self.input_number; i++)
+    for(int i=0; i<self.input_number; i++)  //create listener threads
     {
-        if (pthread_create(&listener[i],NULL,listen_process,&self.input[i]) != 0)
+        if (pthread_create(&self.input[i].listener,NULL,listen_process,&self.input[i]) != 0)
         {
             perror("create");
             exit(1);
         }
-    }
+    }  
 
 
-
-    
-    
-    if (pthread_create(&updater,NULL,update_process, NULL) != 0)
+    if (pthread_create(&updater,NULL,update_process, NULL) != 0) //create updater thread
         {
             perror("create");
             exit(1);
         }
 
-    
 
-
-    for(int i=0; i<self.input_number; i++)
-    {
-        if (pthread_join(listener[i], NULL) != 0) {
-            perror("pthread_join");
-            exit(1);
-        }
-    }
-
-    if (pthread_join(cli, NULL) != 0) {
-            perror("pthread_join");
-            exit(1);
-    }
-
-
-
-    
     exit_program();       //free resources, exit threads, then exit the program
     return 0;    
 }
