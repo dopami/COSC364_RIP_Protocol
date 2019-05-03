@@ -33,6 +33,8 @@ typedef char byte;
 
 char *configName[] =  {"router-id", "input-ports", "outputs"};
 
+bool showlog = false;
+
 //============== Global Variables ============================
 
 struct Peer
@@ -125,18 +127,20 @@ void exit_program()
 
 void log_handler(const char *fmt, ...)
 {
+    if (showlog)
+    {
+        time_t t;
+        time(&t);
+        struct tm *tmp_time = localtime(&t);
+        char s[100];
+        strftime(s, sizeof(s), "%04Y%02m%02d-%H:%M:%S", tmp_time);
+        printf("[LOG-%s]: ", s);
 
-    time_t t;
-    time(&t);
-    struct tm *tmp_time = localtime(&t);
-    char s[100];
-    strftime(s, sizeof(s), "%04Y%02m%02d-%H:%M:%S", tmp_time);
-    printf("[LOG-%s]: ", s);
-
-    va_list ap;
-    va_start(ap, fmt);
-    vprintf(fmt, ap);
-    va_end(ap);
+        va_list ap;
+        va_start(ap, fmt);
+        vprintf(fmt, ap);
+        va_end(ap);
+    }
 }
 
 void* time_handler(void *args)
@@ -361,30 +365,14 @@ void route_table_timeout(void* args)
 
     pthread_mutex_lock(&write_route_table);        //lock
 
-    /*
-    item = routetable;
-    prior = item;
-    bool found = false;
-    
-    do
-    {
-        if(item == address)
-        {
-            found = true;
-            item->metric = MAX_HOP + 1;
-            item->garbage.tv_sec = GARBAGE;
-            break;
-        }
-        prior = item;
-        item = item->next;
-        
-    }while (item != NULL);
-    */
-
     node->metric = MAX_HOP + 1;
     triggered_update(node);
-    pthread_mutex_unlock(&write_route_table);     //unlock
     node->garbage.valid = true;
+
+    pthread_mutex_unlock(&write_route_table);     //unlock
+
+
+    
     set_time(&node->garbage, &node->garbage.timer_thread);
     log_handler("Setting timer %d for garbage collection %d\n", node->garbage.timer, node->address);
     
@@ -491,9 +479,8 @@ void add_route_table(struct ripEntry *re, int nexthop, int iface, int cost)
         node->next_hop = nexthop;
         node->iface = iface;
         node->flag = true;
-        node->next = NULL;
+        
         node->metric = re->metric + cost;   
-
 
         node->timeout.timer.tv_sec = TIMEOUT; 
         
@@ -512,6 +499,20 @@ void add_route_table(struct ripEntry *re, int nexthop, int iface, int cost)
         set_time(&node->timeout, &node->timeout.timer_thread);
         log_handler("Adding %d to timeout timer, route pointer is %d:\n", node->address, node);
 
+        
+        
+        item = routetable->next;
+        prior = routetable;
+
+        while (item != NULL)            //find the place to insert the router table node
+        {
+            if (item->address >= node->address) break;
+
+            prior = item;
+            item = item->next;
+        }
+
+        node->next = item;
         prior->next = node;
     }    
 
