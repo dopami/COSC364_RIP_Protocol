@@ -781,7 +781,7 @@ int readConfig(char *cfg_file, struct ConfigItem *item)
     
     if (fp == NULL) {
         log_handler("Can't read file %s\n", cfg_file);
-        exit_program();
+        exit(1);
     }
         
     while ((len = getline(&line, &len, fp)) != -1) 
@@ -816,7 +816,7 @@ int readConfig(char *cfg_file, struct ConfigItem *item)
                     else if (!check_routerid(atoi(content)))
                     {
                         log_handler("ERROR: router-id invalid at line %d\n", n);
-                        exit_program();
+                        exit(1);
                     }
                     else
                     {
@@ -834,7 +834,7 @@ int readConfig(char *cfg_file, struct ConfigItem *item)
                         if(!check_port(atoi(ptr)))
                         {
                             log_handler("ERROR: port invalid at line %d\n", n);
-                            exit_program();
+                            exit(1);
                         }
                         else
                         {
@@ -873,13 +873,13 @@ int readConfig(char *cfg_file, struct ConfigItem *item)
                         if (dash == NULL)
                         {
                             log_handler("ERROR: format error at line %d\n", n);
-                            exit_program();
+                            exit(1);
                         }
                         strncpy(temp, ptr, dash - ptr);
                         if (!check_port(atoi(temp)))
                         {
                             log_handler("ERROR: port invalid at line %d\n", n);
-                            exit_program();
+                            exit(1);
                         }
                         
                         item->output[item->output_number - 1].port = atoi(temp);
@@ -890,13 +890,13 @@ int readConfig(char *cfg_file, struct ConfigItem *item)
                         if (dash == NULL)
                         {
                             log_handler("ERROR: format error at line %d\n", n);
-                            exit_program();
+                            exit(1);
                         }
                         strncpy(temp, ptr, dash - ptr);
                         if (!check_metric(atoi(temp)))
                         {
                             log_handler("ERROR: metric invalid at line %d\n", n);
-                            exit_program();
+                            exit(1);
                         }
                         item->output[item->output_number - 1].metric = atoi(temp);
 
@@ -905,7 +905,7 @@ int readConfig(char *cfg_file, struct ConfigItem *item)
                         if (!check_routerid(atoi(temp)))
                         {
                             log_handler("ERROR: router-id invalid at line %d\n", n);
-                            exit_program();
+                            exit(1);
                         }
                         item->output[item->output_number - 1].routerid = atoi(temp);
 
