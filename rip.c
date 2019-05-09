@@ -127,48 +127,6 @@ pthread_t cli;
 //==================== helper function ==========================
 
 
-void exit_program()                        //release all resources, wait for thread end, free memory
-{
-
-    //wait for threads end
-
-    struct Route_Table *node = routetable;
-
-    while(node->next != NULL)
-    {
-        if (pthread_join(node->timeout.timer_thread, NULL) != 0) {
-            perror("pthread_join");
-            exit(1);
-        }
-        if (pthread_join(node->garbage.timer_thread, NULL) != 0) {
-            perror("pthread_join");
-            exit(1);
-        }
-        node = node->next;
-    }
-    
-    for(int i=0; i<self.input_number; i++)
-    {
-        if (pthread_join(self.input[i].listener, NULL) != 0) {
-            perror("pthread_join");
-            exit(1);
-        }
-    }
-
-    if (pthread_join(cli, NULL) != 0) {
-            perror("pthread_join");
-            exit(1);
-    }
-
-    free(routetable);
-    free(self.input);
-    free(self.output);
-
-
-
-    exit(0);
-}
-
 void log_handler(const char *fmt, ...)     //just like printf, but add time tag and switch on/off
 {
     if (showlog)
@@ -189,6 +147,61 @@ void log_handler(const char *fmt, ...)     //just like printf, but add time tag 
 
         pthread_mutex_unlock(&screen);     //release lock
     }
+}
+
+void exit_program()                        //release all resources, wait for thread end, free memory
+{
+
+    //wait for threads end
+
+    struct Route_Table *node = routetable;
+    struct Route_Table *prior = node;
+
+
+    log_handler("Killing update thread\n");
+    if (pthread_join(updater, NULL) != 0) {
+            perror("pthread_join");
+            //exit(1);
+    }
+
+    log_handler("Killing listening threads\n");
+    for(int i=0; i<self.input_number; i++)
+    {
+        if (pthread_join(self.input[i].listener, NULL) != 0) {
+            perror("pthread_join");
+            //exit(1);
+        }
+    }
+    log_handler("Killing cli thread\n");
+    if (pthread_join(cli, NULL) != 0) {
+            perror("pthread_join");
+            //exit(1);
+    }
+
+    log_handler("Deleting route table\n");
+    while(node->next != NULL)
+    {
+        if (pthread_join(node->timeout.timer_thread, NULL) != 0) {
+            perror("pthread_join");
+            //exit(1);
+        }
+        if (pthread_join(node->garbage.timer_thread, NULL) != 0) {
+            perror("pthread_join");
+            //exit(1);
+        }
+        prior = node;
+        node = node->next;
+        free(prior);
+    }
+    free(node);
+
+
+    free(self.input);
+    free(self.output);
+
+    log_handler("Goodbye\n");
+
+    exit(0);
 }
 
 void* time_handler(void *args)
@@ -222,7 +235,7 @@ void set_time(struct Timer_Struct *timerdata, pthread_t *timer_thread)
     if (pthread_create(timer_thread,NULL,time_handler,timerdata) != 0) //create timer thread
     {
             perror("TimeHandler");
-            exit(1);
+            exit_program();
     }
 
     log_handler("Timer quit success\n");
@@ -338,6 +351,7 @@ void send_update(struct Interface *interface, struct Route_Table *node)
         }
         log_handler("Sending all route entries from port %d\n", interface->port);
     }
+    free(msg.message);
 }
 
 
@@ -417,7 +431,7 @@ void route_table_timeout(void* args)  //timeout timer handler will call this
     if (pthread_join(node->garbage.timer_thread, NULL) != 0)  //wait garbage handler finish
             {
                 perror("pthread_join");
-                exit(1);
+                exit_program();
             }
 
     if (!node->garbage.valid)      //if garbage is cancelled due to peer back
@@ -583,7 +597,7 @@ void add_route_table(struct RIP_Entry *re, int nexthop, int iface, int cost)
 void print_route_table()  //print route table
 {
     
-    printf("\n===================  Route Table  =====================\n");
+    printf("\n================== #%d Route Table  ====================\n", self.routerid);
     printf("%-6s%-8s%-9s%-9s%-7s%-9s%-10s\n","Dest", "Metric", "NextHop", "ChgFlag", "Iface", "Timeout", "Garbage");
     printf("-------------------------------------------------------\n");
     struct Route_Table *item = routetable->next;
@@ -766,7 +780,8 @@ int readConfig(char *cfg_file, struct ConfigItem *item)
     FILE *fp = fopen(cfg_file, "r");
     
     if (fp == NULL) {
-        exit(EXIT_FAILURE);
+        log_handler("Can't read file %s\n", cfg_file);
+        exit_program();
     }
         
     while ((len = getline(&line, &len, fp)) != -1) 
@@ -972,7 +987,7 @@ void listen_port(struct Interface *interface)  //listener threads will call this
     rc = bind(interface->sockfd,(struct sockaddr *)&local,sizeof(local)); // bind address to socket 
     if(rc == -1) { // Check for errors
         perror("bind");
-        exit(1);
+        exit_program();
     }
 
     log_handler("Listening on port %d\n", interface->port);
@@ -1059,7 +1074,7 @@ void* listen_process(void *argv)  //listener
 
 void* update_process()   //periodic updater
 {
-    while(1)
+    while(!gracequit)
     {
         for (int i = 0; i < self.input_number; i++)
         {
@@ -1171,13 +1186,15 @@ int main(int argc, char **argv)
 
 
 
-    init();
+    
 
     if (argc != 2) 
     {
         fprintf(stderr, "usage: ./rip configure_file\n");
         exit(1);
     }
+
+    init();
 
     showlog = true;
     readConfig(argv[1], &self);
@@ -1189,7 +1206,7 @@ int main(int argc, char **argv)
     if (pthread_create(&cli,NULL,CLI_daemon, NULL) != 0)
         {
             perror("create");
-            exit(1);
+            exit_program();
         }
 
 
@@ -1199,7 +1216,7 @@ int main(int argc, char **argv)
         if (pthread_create(&self.input[i].listener,NULL,listen_process,&self.input[i]) != 0)
         {
             perror("create");
-            exit(1);
+            exit_program();
         }
     }  
 
@@ -1207,7 +1224,7 @@ int main(int argc, char **argv)
     if (pthread_create(&updater,NULL,update_process, NULL) != 0) //create updater thread
         {
             perror("create");
-            exit(1);
+            exit_program();
         }
 
 
