@@ -481,8 +481,8 @@ void add_route_table(struct RIP_Entry *re, int nexthop, int iface, int cost)
     if(found)       //we found one with same destination
     {
         
-        if(item->metric == re->metric + cost && item->metric != MAX_HOP + 1) 
-        //the metric is not optimal, and not the poison-reverse or triggered updates
+        if(item->metric == re->metric + cost && item->metric != MAX_HOP + 1 && item->next_hop == nexthop) 
+        //the update from current route, with same metric, and not the poison-reverse or triggered updates
         {
 
             pthread_mutex_lock(&item->timeout.change_time); 
