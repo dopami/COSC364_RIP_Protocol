@@ -1,1 +1,2 @@
-# RIP_Protocol
+# COSC364 Assignment 1 - RIP Protocol
+in C language
